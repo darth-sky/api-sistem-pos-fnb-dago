@@ -1,0 +1,15 @@
+create table if not exists db_library.tb_authors
+(
+    author_id  int auto_increment
+        primary key,
+    first_name varchar(50)                         not null,
+    last_name  varchar(50)                         not null,
+    created_at timestamp default CURRENT_TIMESTAMP not null,
+    updated_at timestamp default CURRENT_TIMESTAMP not null,
+    deleted_at timestamp                           null
+)
+    comment 'Store the master data for The authors of books';
+
+create index tb_authors_last_name_index
+    on db_library.tb_authors (last_name);
+
