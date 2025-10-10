@@ -7,9 +7,544 @@ from flask_jwt_extended import jwt_required
 from helper.year_operation import diff_year
 from helper.year_operation import check_age_book
 from flask import jsonify
+from datetime import datetime, time
 
 kasir_endpoints = Blueprint('kasir', __name__)
 UPLOAD_FOLDER = "img"
+
+
+# Fungsi helper untuk menentukan level warna berdasarkan sisa waktu
+# def get_time_level(time_left_seconds):
+#     if time_left_seconds is None:
+#         return "gray" # Selesai
+#     elif time_left_seconds > 3600: # Lebih dari 1 jam
+#         return "green"
+#     elif time_left_seconds > 900: # Lebih dari 15 menit
+#         return "yellow"
+#     else: # Kurang dari 15 menit
+#         return "red"
+
+@kasir_endpoints.route('/dashboard-data', methods=['GET'])
+def get_kasir_dashboard_data():
+    """
+    Endpoint untuk mengambil semua data yang dibutuhkan oleh dasbor kasir.
+    - Ringkasan transaksi, sewa aktif, dan ruangan tersedia.
+    - Agregasi tipe ruangan (total & tersedia).
+    - Daftar unit ruangan yang tersedia saat ini.
+    - Daftar sewa yang aktif dan yang sudah selesai pada hari ini.
+    """
+    connection = None  # Inisialisasi di luar try block
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        # --- 1. Data Ringkasan Atas ---
+        # Today's Transaction
+        query_today_transaction = """
+        SELECT SUM(total_harga_final) as total 
+        FROM transaksi 
+        WHERE DATE(tanggal_transaksi) = CURDATE() AND status_pembayaran = 'Lunas';
+        """
+        cursor.execute(query_today_transaction)
+        today_transaction = cursor.fetchone()['total'] or 0
+
+        # Active Space Rental
+        query_active_rentals = """
+        SELECT COUNT(id_booking) as count FROM booking_ruangan 
+        WHERE NOW() BETWEEN waktu_mulai AND waktu_selesai;
+        """
+        cursor.execute(query_active_rentals)
+        active_rentals_count = cursor.fetchone()['count'] or 0
+        
+        # Total Rooms and Available Rooms
+        query_total_rooms = "SELECT COUNT(id_ruangan) as count FROM ruangan WHERE status_ketersediaan = 'Active';"
+        cursor.execute(query_total_rooms)
+        total_rooms = cursor.fetchone()['count'] or 0
+        available_rooms_count = total_rooms - active_rentals_count
+
+        summary_data = {
+            "todayTransaction": int(today_transaction),
+            "spaceRental": active_rentals_count,
+            "spaceAvailable": available_rooms_count
+        }
+        
+        # --- 2. Data Tipe Unit Ruangan ---
+        query_space_types = """
+            SELECT 
+                kr.nama_kategori as name, 
+                COUNT(r.id_ruangan) as total,
+                (COUNT(r.id_ruangan) - (
+                    SELECT COUNT(br.id_booking) 
+                    FROM booking_ruangan br
+                    JOIN ruangan r_inner ON br.id_ruangan = r_inner.id_ruangan
+                    WHERE r_inner.id_kategori_ruangan = kr.id_kategori_ruangan AND NOW() BETWEEN br.waktu_mulai AND br.waktu_selesai
+                )) as available
+            FROM ruangan r
+            JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan
+            WHERE r.status_ketersediaan = 'Active'
+            GROUP BY kr.id_kategori_ruangan, kr.nama_kategori;
+        """
+        cursor.execute(query_space_types)
+        space_types_data = cursor.fetchall()
+
+        # --- 3. Data Unit yang Tersedia ---
+        query_available_units = """
+            SELECT nama_ruangan FROM ruangan 
+            WHERE status_ketersediaan = 'Active' AND id_ruangan NOT IN (
+                SELECT id_ruangan FROM booking_ruangan WHERE NOW() BETWEEN waktu_mulai AND waktu_selesai
+            );
+        """
+        cursor.execute(query_available_units)
+        available_units_data = [row['nama_ruangan'] for row in cursor.fetchall()]
+
+        # --- 4. Data Sewa (Aktif & Selesai Hari Ini) ---
+        query_rentals = """
+            SELECT 
+                br.id_booking as id,
+                COALESCE(u.nama, t.nama_guest) as client,
+                r.nama_ruangan as unit,
+                t.total_harga_final as price,
+                br.waktu_mulai,
+                br.waktu_selesai
+            FROM booking_ruangan br
+            JOIN transaksi t ON br.id_transaksi = t.id_transaksi
+            JOIN ruangan r ON br.id_ruangan = r.id_ruangan
+            LEFT JOIN users u ON t.id_user = u.id_user
+            WHERE DATE(br.waktu_mulai) = CURDATE()
+            ORDER BY br.waktu_mulai DESC;
+        """
+        cursor.execute(query_rentals)
+        all_rentals_today = cursor.fetchall()
+        
+        rentals_active = []
+        rentals_finish = []
+        
+        now = datetime.now()
+        for rental in all_rentals_today:
+            # Format data dasar
+            rental['price'] = int(rental['price'])
+            # 'date' untuk ditampilkan di UI, formatnya bisa disesuaikan
+            rental['date'] = rental['waktu_mulai'].strftime('%d/%m/%Y %H:%M')
+
+            # PERUBAHAN UTAMA:
+            # Kirim waktu mulai dan selesai sebagai string ISO 8601.
+            # Ini adalah format standar yang mudah diparsing oleh JavaScript.
+            waktu_mulai_obj = rental['waktu_mulai']
+            waktu_selesai_obj = rental['waktu_selesai']
+            
+            rental['waktu_mulai'] = waktu_mulai_obj.isoformat()
+            rental['waktu_selesai'] = waktu_selesai_obj.isoformat()
+
+            # Hapus kalkulasi 'time' dan 'level' dari sini
+            
+            # Pisahkan antara yang aktif dan yang sudah selesai
+            if now >= waktu_mulai_obj and now <= waktu_selesai_obj:
+                rentals_active.append(rental)
+            elif now > waktu_selesai_obj:
+                rentals_finish.append(rental)
+
+        return jsonify({
+            "message": "OK",
+            "datas": {
+                "summary": summary_data,
+                "spaceTypes": space_types_data,
+                "availableUnits": available_units_data,
+                "rentals": {
+                    "active": rentals_active,
+                    "finish": rentals_finish
+                }
+            }
+        })
+
+    except Exception as e:
+        # Log error untuk debugging di sisi server jika perlu
+        print(f"Error in /dashboard-data: {e}")
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        # Pastikan koneksi ditutup dengan aman
+        if connection and connection.is_connected():
+            cursor.close()
+            connection.close()
+
+# @kasir_endpoints.route('/dashboard-data', methods=['GET'])
+# def get_kasir_dashboard_data():
+#     try:
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
+        
+#         # --- 1. Data Ringkasan Atas ---
+#         # Today's Transaction
+#         query_today_transaction = """
+#         SELECT SUM(total_harga_final) as total 
+#         FROM transaksi 
+#         WHERE DATE(tanggal_transaksi) = CURDATE() AND status_pembayaran = 'Lunas';
+#         """
+#         cursor.execute(query_today_transaction)
+#         today_transaction = cursor.fetchone()['total'] or 0
+
+#         # Active Space Rental
+#         query_active_rentals = """
+#         SELECT COUNT(id_booking) as count FROM booking_ruangan 
+#         WHERE NOW() BETWEEN waktu_mulai AND waktu_selesai;
+#         """
+#         cursor.execute(query_active_rentals)
+#         active_rentals_count = cursor.fetchone()['count'] or 0
+        
+#         # Total Rooms and Available Rooms
+#         query_total_rooms = "SELECT COUNT(id_ruangan) as count FROM ruangan WHERE status_ketersediaan = 'Active';"
+#         cursor.execute(query_total_rooms)
+#         total_rooms = cursor.fetchone()['count'] or 0
+#         available_rooms_count = total_rooms - active_rentals_count
+
+#         summary_data = {
+#             "todayTransaction": int(today_transaction),
+#             "spaceRental": active_rentals_count,
+#             "spaceAvailable": available_rooms_count
+#         }
+        
+#         # --- 2. Data Tipe Unit Ruangan ---
+#         query_space_types = """
+#             SELECT 
+#                 kr.nama_kategori as name, 
+#                 COUNT(r.id_ruangan) as total,
+#                 (COUNT(r.id_ruangan) - (
+#                     SELECT COUNT(br.id_booking) 
+#                     FROM booking_ruangan br
+#                     JOIN ruangan r_inner ON br.id_ruangan = r_inner.id_ruangan
+#                     WHERE r_inner.id_kategori_ruangan = kr.id_kategori_ruangan AND NOW() BETWEEN br.waktu_mulai AND br.waktu_selesai
+#                 )) as available
+#             FROM ruangan r
+#             JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan
+#             WHERE r.status_ketersediaan = 'Active'
+#             GROUP BY kr.id_kategori_ruangan, kr.nama_kategori;
+#         """
+#         cursor.execute(query_space_types)
+#         space_types_data = cursor.fetchall()
+
+#         # --- 3. Data Unit yang Tersedia ---
+#         query_available_units = """
+#             SELECT nama_ruangan FROM ruangan 
+#             WHERE status_ketersediaan = 'Active' AND id_ruangan NOT IN (
+#                 SELECT id_ruangan FROM booking_ruangan WHERE NOW() BETWEEN waktu_mulai AND waktu_selesai
+#             );
+#         """
+#         cursor.execute(query_available_units)
+#         # Mengubah format dari list of dict menjadi list of string
+#         available_units_data = [row['nama_ruangan'] for row in cursor.fetchall()]
+
+#         # --- 4. Data Sewa (Aktif & Selesai Hari Ini) ---
+#         query_rentals = """
+#             SELECT 
+#                 br.id_booking as id,
+#                 COALESCE(u.nama, t.nama_guest) as client,
+#                 r.nama_ruangan as unit,
+#                 t.tanggal_transaksi as date,
+#                 t.total_harga_final as price,
+#                 br.waktu_mulai,
+#                 br.waktu_selesai
+#             FROM booking_ruangan br
+#             JOIN transaksi t ON br.id_transaksi = t.id_transaksi
+#             JOIN ruangan r ON br.id_ruangan = r.id_ruangan
+#             LEFT JOIN users u ON t.id_user = u.id_user
+#             WHERE DATE(br.waktu_mulai) = CURDATE()
+#             ORDER BY br.waktu_mulai DESC;
+#         """
+#         cursor.execute(query_rentals)
+#         all_rentals_today = cursor.fetchall()
+        
+#         rentals_active = []
+#         rentals_finish = []
+        
+#         now = datetime.now()
+#         for rental in all_rentals_today:
+#             # Format ulang data untuk frontend
+#             rental['price'] = int(rental['price'])
+#             rental['date'] = rental['waktu_mulai'].strftime('%d/%m/%Y %H:%M')
+            
+#             if now >= rental['waktu_mulai'] and now <= rental['waktu_selesai']:
+#                 time_left = rental['waktu_selesai'] - now
+#                 time_left_seconds = time_left.total_seconds()
+#                 # Format sisa waktu menjadi HH:MM:SS
+#                 hours, remainder = divmod(time_left_seconds, 3600)
+#                 minutes, seconds = divmod(remainder, 60)
+#                 rental['time'] = '{:02}:{:02}:{:02}'.format(int(hours), int(minutes), int(seconds))
+#                 rental['level'] = get_time_level(time_left_seconds)
+#                 rentals_active.append(rental)
+#             elif now > rental['waktu_selesai']:
+#                 rental['time'] = "Finished"
+#                 rental['level'] = "gray" # Warna untuk yang sudah selesai
+#                 rentals_finish.append(rental)
+
+#         return jsonify({
+#             "message": "OK",
+#             "datas": {
+#                 "summary": summary_data,
+#                 "spaceTypes": space_types_data,
+#                 "availableUnits": available_units_data,
+#                 "rentals": {
+#                     "active": rentals_active,
+#                     "finish": rentals_finish
+#                 }
+#             }
+#         })
+
+#     except Exception as e:
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if 'connection' in locals() and connection.is_connected():
+#             cursor.close()
+#             connection.close()
+
+@kasir_endpoints.route("/historyKasir", methods=["GET"])
+def get_history_kasir():
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        start_date = request.args.get("start_date")
+        end_date = request.args.get("end_date")
+
+        # format tanggal langsung ditulis di SQL string agar tidak kena parsing %
+        base_query = (
+            "SELECT "
+            "t.id_transaksi, "
+            "CONCAT(DAY(t.tanggal_transaksi), ' ', MONTHNAME(t.tanggal_transaksi), ' ', YEAR(t.tanggal_transaksi), ' ', LPAD(HOUR(t.tanggal_transaksi), 2, '0'), ':', LPAD(MINUTE(t.tanggal_transaksi), 2, '0'), ':', LPAD(SECOND(t.tanggal_transaksi), 2, '0')) AS datetime, "
+            "COALESCE(t.nama_guest, 'Guest') AS name, "
+            "t.metode_pembayaran AS payment, "
+            "COALESCE(t.lokasi_pemesanan, '-') AS table_name, "
+            "t.total_harga_final AS total, "
+            "0 AS discount, "
+            "0 AS tax, "
+            "t.total_harga_final AS subtotal "
+            "FROM transaksi t "
+            "WHERE t.status_pembayaran = 'Lunas' AND ("
+            "  EXISTS (SELECT 1 FROM detail_order_fnb dof WHERE dof.id_transaksi = t.id_transaksi) OR "
+            "  EXISTS (SELECT 1 FROM booking_ruangan br WHERE br.id_transaksi = t.id_transaksi)"
+            ")"
+        )
+
+        params = ()
+
+        if start_date and end_date:
+            # Perhatikan ada 't.' sebelum tanggal_transaksi untuk menyesuaikan alias tabel
+            base_query += " AND t.tanggal_transaksi BETWEEN %s AND %s"
+            params = (start_date, end_date)
+
+        base_query += " ORDER BY t.tanggal_transaksi DESC"
+
+        print("🧩 QUERY:", base_query)
+        print("📅 PARAMS:", params)
+
+        cursor.execute(base_query, params)
+        results = cursor.fetchall()
+
+        return jsonify({"message": "OK", "datas": results}), 200
+
+    except Exception as e:
+        print("🔥 ERROR get_history_kasir:", str(e))
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@kasir_endpoints.route("/readProdukKasir", methods=["GET"])
+def read_produk_kasir():
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        query = """
+        SELECT 
+            p.id_produk,
+            p.nama_produk AS product,
+            p.deskripsi_produk AS deskripsi,
+            p.harga AS price,
+            p.status_ketersediaan AS status,
+            p.foto_produk AS foto,
+            k.nama_kategori AS category,
+            t.nama_tenant AS merchant,
+            NOW() AS updated
+        FROM produk_fnb p
+        JOIN kategori_produk k ON p.id_kategori = k.id_kategori
+        LEFT JOIN tenants t ON k.id_tenant = t.id_tenant
+        ORDER BY p.id_produk DESC
+        """
+
+        cursor.execute(query)
+        results = cursor.fetchall()
+        return jsonify({"message": "OK", "datas": results}), 200
+
+    except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+# Di file endpoint kasir Anda
+@kasir_endpoints.route('/pos-init', methods=['GET'])
+def get_pos_init_data():
+    """
+    Satu endpoint untuk mengambil semua data yang diperlukan
+    oleh halaman kasir (POS) saat pertama kali dimuat.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. Ambil semua produk F&B (aktif dan inaktif)
+        # --- PERBAIKAN DI SINI --- Hapus 'WHERE p.status_ketersediaan = 'Active''
+        query_products = """
+            SELECT
+                p.id_produk AS id,
+                p.nama_produk AS name,
+                p.harga AS price,
+                p.status_ketersediaan,
+                k.id_tenant AS merchantId,
+                k.nama_kategori AS category
+            FROM produk_fnb p
+            JOIN kategori_produk k ON p.id_kategori = k.id_kategori
+            ORDER BY p.nama_produk;
+        """
+        cursor.execute(query_products)
+        products_raw = cursor.fetchall()
+        
+        # Logika ini sudah benar, akan mengubah status menjadi true/false
+        products = [
+            {**p, "available": p.pop('status_ketersediaan') == 'Active'}
+            for p in products_raw
+        ]
+
+        # 2. Ambil kategori tenant (merchant) - (Tidak ada perubahan)
+        query_merchants = "SELECT id_tenant AS id, nama_tenant AS name FROM tenants ORDER BY name;"
+        cursor.execute(query_merchants)
+        merchant_categories = cursor.fetchall()
+        merchant_categories.insert(0, {'id': 'all_merchants', 'name': 'All Merchants'})
+
+        # 3. Ambil kategori produk (tipe) - (Tidak ada perubahan)
+        query_product_types = "SELECT DISTINCT nama_kategori AS name FROM kategori_produk ORDER BY name;"
+        cursor.execute(query_product_types)
+        product_types_raw = cursor.fetchall()
+        product_type_categories = [{'id': 'all_types', 'name': 'All Types'}]
+        product_type_categories.extend([{'id': pt['name'], 'name': pt['name']} for pt in product_types_raw])
+
+        # 4. Data tipe order - (Tidak ada perubahan)
+        order_types = [
+            {'id': 'dinein', 'name': 'Dine In'},
+            {'id': 'takeaway', 'name': 'Take Away'},
+            {'id': 'pickup', 'name': 'Pick Up'}
+        ]
+
+        # Gabungkan semua data menjadi satu respons - (Tidak ada perubahan)
+        init_data = {
+            "products": products,
+            "merchantCategories": merchant_categories,
+            "productTypeCategories": product_type_categories,
+            "orderTypes": order_types
+        }
+
+        return jsonify({"message": "OK", "datas": init_data}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+#=========================================================================================
+# ENDPOINT 2: Membuat order baru dari kasir
+#=========================================================================================
+@kasir_endpoints.route('/order', methods=['POST'])
+def create_order():
+    """
+    Menerima data order dari frontend dan menyimpannya ke database.
+    Menggunakan transaksi untuk memastikan integritas data.
+    """
+    connection = None
+    cursor = None
+    try:
+        data = request.get_json()
+        if not data or 'items' not in data or not data['items']:
+            return jsonify({"message": "ERROR", "error": "Invalid order data"}), 400
+
+        connection = get_connection()
+        cursor = connection.cursor()
+        
+        # Mulai transaksi database
+        connection.start_transaction()
+
+        # 1. Insert ke tabel 'transaksi'
+        # Mapping tipe F&B dari frontend ke ENUM di DB
+        fnb_type_map = {
+            'dinein': 'Dine In',
+            'takeaway': 'Takeaway',
+            'pickup': 'Pick Up'
+        }
+        fnb_type = fnb_type_map.get(data.get('orderType'), 'Takeaway')
+
+        query_transaksi = """
+            INSERT INTO transaksi (
+                nama_guest, lokasi_pemesanan, fnb_type, metode_pembayaran,
+                total_harga_final, status_pembayaran, status_order
+            ) VALUES (%s, %s, %s, %s, %s, 'Lunas', 'Baru');
+        """
+        transaksi_values = (
+            data.get('customerName'),
+            data.get('room'),
+            fnb_type,
+            data.get('paymentMethod'),
+            data.get('totalAmount')
+        )
+        cursor.execute(query_transaksi, transaksi_values)
+        
+        # Ambil ID dari transaksi yang baru saja dibuat
+        id_transaksi_baru = cursor.lastrowid
+
+        # 2. Insert setiap item ke tabel 'detail_order_fnb'
+        query_detail = """
+            INSERT INTO detail_order_fnb (
+                id_transaksi, id_produk, jumlah, harga_saat_order, catatan_pesanan
+            ) VALUES (%s, %s, %s, %s, %s);
+        """
+        for item in data['items']:
+            detail_values = (
+                id_transaksi_baru,
+                item['id'],
+                item['qty'],
+                item['price'],
+                item.get('note')
+            )
+            cursor.execute(query_detail, detail_values)
+
+        # Jika semua berhasil, commit transaksi
+        connection.commit()
+
+        return jsonify({
+            "message": "OK",
+            "info": "Order created successfully",
+            "id_transaksi": id_transaksi_baru
+        }), 201
+
+    except Exception as e:
+        # Jika terjadi error, batalkan semua perubahan
+        if connection:
+            connection.rollback()
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 @kasir_endpoints.route('/productsKasir', methods=['GET'])
@@ -328,6 +863,7 @@ def readMerchantOrders():
             t.metode_pembayaran,
             t.total_harga_final,
             t.tanggal_transaksi,
+            t.fnb_type,
 
             d.id_detail_order,
             p.nama_produk,
@@ -359,6 +895,7 @@ def readMerchantOrders():
                         else "Canceled"
                     ),
                     "type": "FNB",
+                    "fnb_type": row["fnb_type"],  # 🆕 Tambahkan baris ini
                     "payment_status": row["status_pembayaran"],
                     "payment_method": row["metode_pembayaran"],
                     "total": float(row["total_harga_final"]),

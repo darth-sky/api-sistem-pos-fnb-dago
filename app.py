@@ -15,6 +15,18 @@ from api.virtualOffice.endpoints import virtualOffice_endpoints
 from api.memberships.endpoints import memberships_endpoints
 from api.transaksi.endpoints import transaksi_endpoints
 from api.produk.endpoints import produk_endpoints
+from api.produkadmin.endpoints import produkadmin_endpoints
+from api.ruanganadmin.endpoints import ruanganadmin_endpoints
+from api.eventspacesadmin.endpoints import eventspacesadmin_endpoints
+from api.membershipadmin.endpoints import membershipadmin_endpoints
+from api.virtualofficeadmin.endpoints import virtualofficeadmin_endpoints
+from api.promo.endpoints import promo_endpoints
+from api.promoadmin.endpoints import promoadmin_endpoints
+from api.tenant.endpoints import tenant_endpoints
+from api.eventSpaces.endpoints import eventspaces_endpoints
+from api.tenantadmin.endpoints import tenantadmin_endpoints
+from api.useradmin.endpoints import useradmin_endpoints
+from api.owner.endpoints import owner_endpoints
 
 from config import Config
 from static.static_file_server import static_file_server
@@ -44,7 +56,18 @@ app.register_blueprint(virtualOffice_endpoints, url_prefix='/api/v1/virtualOffic
 app.register_blueprint(memberships_endpoints, url_prefix='/api/v1/memberships/')
 app.register_blueprint(transaksi_endpoints, url_prefix='/api/v1/transaksi/')
 app.register_blueprint(produk_endpoints, url_prefix='/api/v1/produk/')
-
+app.register_blueprint(produkadmin_endpoints, url_prefix='/api/v1/produkadmin/')
+app.register_blueprint(ruanganadmin_endpoints, url_prefix='/api/v1/ruanganadmin/')
+app.register_blueprint(eventspacesadmin_endpoints, url_prefix='/api/v1/eventspacesadmin/')
+app.register_blueprint(membershipadmin_endpoints, url_prefix='/api/v1/membershipadmin/')
+app.register_blueprint(virtualofficeadmin_endpoints, url_prefix='/api/v1/virtualofficeadmin/')
+app.register_blueprint(promo_endpoints, url_prefix='/api/v1/promo/')
+app.register_blueprint(promoadmin_endpoints, url_prefix='/api/v1/promoadmin/')
+app.register_blueprint(tenant_endpoints, url_prefix='/api/v1/tenant/')
+app.register_blueprint(eventspaces_endpoints, url_prefix='/api/v1/eventspaces/')
+app.register_blueprint(tenantadmin_endpoints, url_prefix='/api/v1/tenantadmin/')
+app.register_blueprint(useradmin_endpoints, url_prefix='/api/v1/useradmin/')
+app.register_blueprint(owner_endpoints, url_prefix='/api/v1/owner/')
 
 
 if __name__ == '__main__':

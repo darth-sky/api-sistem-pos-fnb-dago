@@ -9,7 +9,162 @@ from helper.year_operation import check_age_book
 import traceback
 
 virtualOffice_endpoints = Blueprint('virtualOffice', __name__)
-UPLOAD_FOLDER = "img"
+# UPLOAD_FOLDER = "img"
+
+import traceback # untuk debugging lebih detail
+from werkzeug.utils import secure_filename
+
+# Definisikan folder upload, mirip seperti di produkadmin
+VO_UPLOAD_FOLDER = "uploads/vo_documents"
+ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg"}
+
+# Buat folder jika belum ada
+if not os.path.exists(VO_UPLOAD_FOLDER):
+    os.makedirs(VO_UPLOAD_FOLDER)
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+
+
+@virtualOffice_endpoints.route('/paket-vo/<int:paket_id>', methods=['GET'])
+def get_paket_vo_by_id(paket_id):
+    """
+    Endpoint untuk mengambil detail satu paket Virtual Office berdasarkan ID.
+    """
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        query = "SELECT * FROM paket_virtual_office WHERE id_paket_vo = %s"
+        cursor.execute(query, (paket_id,))
+        paket = cursor.fetchone()
+
+        if not paket:
+            return jsonify({"message": "ERROR", "error": "Paket tidak ditemukan"}), 404
+        
+        # Ubah harga menjadi string agar konsisten dengan data statis sebelumnya jika perlu
+        paket['harga'] = str(paket['harga'])
+
+        return jsonify({"message": "OK", "data": paket}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'connection' in locals() and connection:
+            connection.close()
+
+# Ganti endpoint register_virtual_office yang lama dengan yang ini
+@virtualOffice_endpoints.route('/register', methods=['POST'])
+def register_virtual_office():
+    """
+    Proses pendaftaran Virtual Office:
+    1. Menerima data dari form-data (termasuk file).
+    2. Menyimpan dokumen pendukung.
+    3. Membuat transaksi pembelian paket VO.
+    4. Menghitung tanggal mulai & berakhir secara aman.
+    5. Menyimpan detail klien di client_virtual_office.
+    """
+    connection = None
+    cursor = None
+    try:
+        # --- 1. Ambil Data dari Form dan File ---
+        id_user_str = request.form.get("id_user")
+        id_user = int(id_user_str) if id_user_str and id_user_str.isdigit() else None
+        id_paket_vo = request.form.get("id_paket_vo")
+        nama = request.form.get("nama")
+        jabatan = request.form.get("jabatan")
+        nama_perusahaan_klien = request.form.get("nama_perusahaan_klien")
+        bidang_perusahaan = request.form.get("bidang_perusahaan")
+        alamat_perusahaan = request.form.get("alamat_perusahaan")
+        email_perusahaan = request.form.get("email_perusahaan")
+        alamat_domisili = request.form.get("alamat_domisili")
+        nomor_telepon = request.form.get("nomor_telepon")
+        tanggal_mulai_str = request.form.get("tanggal_mulai") # Format: YYYY-MM-DD
+
+        if not id_paket_vo or not nama_perusahaan_klien:
+            return jsonify({"message": "ID paket dan nama perusahaan wajib diisi"}), 400
+
+        # --- 2. Proses dan Simpan File yang Diunggah ---
+        file = request.files.get('dokumenPendukung')
+        doc_filename = None
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            filepath = os.path.join(VO_UPLOAD_FOLDER, filename)
+            file.save(filepath)
+            doc_filename = filename
+        else:
+            return jsonify({"message": "File dokumen pendukung (PDF/JPG/PNG) wajib diunggah."}), 400
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # --- 3. Ambil Detail Paket & Buat Transaksi ---
+        cursor.execute("SELECT harga, durasi FROM paket_virtual_office WHERE id_paket_vo = %s", (id_paket_vo,))
+        paket = cursor.fetchone()
+        if not paket:
+            return jsonify({"message": "Paket Virtual Office tidak ditemukan"}), 404
+
+        cursor.execute(
+            "INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order) VALUES (%s, %s, %s, %s, %s)",
+            (id_user, paket["harga"], "Non-Tunai", "Belum Lunas", "Baru")
+        )
+        id_transaksi = cursor.lastrowid
+
+        # --- 4. Hitung Tanggal Mulai dan Berakhir dengan Aman ---
+        start_date_for_calc = tanggal_mulai_str if tanggal_mulai_str else 'CURDATE()'
+        
+        query_end_date = f"SELECT DATE_ADD({ 'CURDATE()' if not tanggal_mulai_str else '%s' }, INTERVAL %s DAY) as end_date"
+        
+        params_end_date = (paket["durasi"],) if not tanggal_mulai_str else (start_date_for_calc, paket["durasi"])
+
+        cursor.execute(query_end_date, params_end_date)
+        end_date_result = cursor.fetchone()
+        
+        if not end_date_result:
+            raise Exception("Gagal menghitung tanggal berakhir")
+        end_date = end_date_result["end_date"]
+
+        # --- 5. Simpan Data Klien VO ke Database ---
+        insert_vo_query = """
+        INSERT INTO client_virtual_office (
+            id_user, id_paket_vo, id_transaksi, nama, jabatan, nama_perusahaan_klien, 
+            bidang_perusahaan, alamat_perusahaan, email_perusahaan, alamat_domisili, 
+            nomor_telepon, tanggal_mulai, tanggal_berakhir, status_client_vo, doc_path
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Aktif', %s)
+        """
+        cursor.execute(insert_vo_query, (
+            id_user, id_paket_vo, id_transaksi, nama, jabatan, nama_perusahaan_klien,
+            bidang_perusahaan, alamat_perusahaan, email_perusahaan, alamat_domisili,
+            nomor_telepon, tanggal_mulai_str, end_date, doc_filename
+        ))
+
+        connection.commit()
+        
+        return jsonify({
+            "message": "OK",
+            "id_transaksi": id_transaksi
+        }), 201
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        print(f"ERROR: {e}")
+        traceback.print_exc()
+        return jsonify({"message": "Terjadi kesalahan pada server", "error": str(e)}), 500
+    
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
 
 
 @virtualOffice_endpoints.route('/read', methods=['GET'])
@@ -58,6 +213,40 @@ def get_paket_vo():
 
 # halaman cekmasavo start
 
+# @virtualOffice_endpoints.route('/cekMasaVO/<int:id_user>', methods=['GET'])
+# def get_vo_detail(id_user):
+#     try:
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
+
+#         query = """
+#         SELECT 
+#             cvo.id_client_vo,
+#             cvo.tanggal_mulai,
+#             cvo.tanggal_berakhir,
+#             cvo.status_client_vo,
+#             pvo.nama_paket,
+#             pvo.harga,
+#             pvo.durasi
+#         FROM client_virtual_office cvo
+#         JOIN paket_virtual_office pvo ON cvo.id_paket_vo = pvo.id_paket_vo
+#         WHERE cvo.id_user = %s
+#         ORDER BY cvo.tanggal_mulai DESC
+#         LIMIT 1
+#         """
+#         cursor.execute(query, (id_user,))
+#         result = cursor.fetchone()
+
+#         if not result:
+#             return jsonify({"message": "Not Found"}), 404
+
+#         return jsonify({"message": "OK", "data": result})
+
+#     except Exception as e:
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor: cursor.close()
+#         if connection: connection.close()
 @virtualOffice_endpoints.route('/cekMasaVO/<int:id_user>', methods=['GET'])
 def get_vo_detail(id_user):
     try:
@@ -67,6 +256,7 @@ def get_vo_detail(id_user):
         query = """
         SELECT 
             cvo.id_client_vo,
+            cvo.id_paket_vo,         -- <-- TAMBAHKAN BARIS INI
             cvo.tanggal_mulai,
             cvo.tanggal_berakhir,
             cvo.status_client_vo,
@@ -95,100 +285,100 @@ def get_vo_detail(id_user):
 
 # halaman cekmasavo end
 
-@virtualOffice_endpoints.route('/register', methods=['POST'])
-def register_virtual_office():
-    """
-    Proses pendaftaran Virtual Office:
-    1. Buat transaksi pembelian paket VO
-    2. Simpan detail klien di client_virtual_office
-    """
-    connection = None
-    cursor = None
-    try:
-        data = request.get_json()
-        print("DEBUG DATA VO:", data)
+# @virtualOffice_endpoints.route('/register', methods=['POST'])
+# def register_virtual_office():
+#     """
+#     Proses pendaftaran Virtual Office:
+#     1. Buat transaksi pembelian paket VO
+#     2. Simpan detail klien di client_virtual_office
+#     """
+#     connection = None
+#     cursor = None
+#     try:
+#         data = request.get_json()
+#         print("DEBUG DATA VO:", data)
         
-        id_user = data.get("id_user")  # bisa NULL kalau guest
-        id_paket_vo = data.get("id_paket_vo")
+#         id_user = data.get("id_user")  # bisa NULL kalau guest
+#         id_paket_vo = data.get("id_paket_vo")
 
-        # Data tambahan
-        nama = data.get("nama")
-        jabatan = data.get("jabatan")
-        nama_perusahaan_klien = data.get("nama_perusahaan_klien")
-        bidang_perusahaan = data.get("bidang_perusahaan")
-        alamat_perusahaan = data.get("alamat_perusahaan")
-        email_perusahaan = data.get("email_perusahaan")
-        alamat_domisili = data.get("alamat_domisili")
-        nomor_telepon = data.get("nomor_telepon")
+#         # Data tambahan
+#         nama = data.get("nama")
+#         jabatan = data.get("jabatan")
+#         nama_perusahaan_klien = data.get("nama_perusahaan_klien")
+#         bidang_perusahaan = data.get("bidang_perusahaan")
+#         alamat_perusahaan = data.get("alamat_perusahaan")
+#         email_perusahaan = data.get("email_perusahaan")
+#         alamat_domisili = data.get("alamat_domisili")
+#         nomor_telepon = data.get("nomor_telepon")
 
-        if not id_paket_vo or not nama_perusahaan_klien:
-            return jsonify({"message": "ID paket dan nama perusahaan wajib diisi"}), 400
+#         if not id_paket_vo or not nama_perusahaan_klien:
+#             return jsonify({"message": "ID paket dan nama perusahaan wajib diisi"}), 400
 
-        connection = get_connection()
-        cursor = connection.cursor(dictionary=True)
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
 
-        # 🔹 Ambil detail paket virtual office
-        cursor.execute("""
-            SELECT harga, durasi 
-            FROM paket_virtual_office 
-            WHERE id_paket_vo = %s
-        """, (id_paket_vo,))
-        paket = cursor.fetchone()
+#         # 🔹 Ambil detail paket virtual office
+#         cursor.execute("""
+#             SELECT harga, durasi 
+#             FROM paket_virtual_office 
+#             WHERE id_paket_vo = %s
+#         """, (id_paket_vo,))
+#         paket = cursor.fetchone()
 
-        if not paket:
-            return jsonify({"message": "Paket Virtual Office tidak ditemukan"}), 404
+#         if not paket:
+#             return jsonify({"message": "Paket Virtual Office tidak ditemukan"}), 404
 
-        # 🔹 Insert transaksi
-        insert_transaksi = """
-        INSERT INTO transaksi (id_user, tanggal_transaksi, total_harga_final, 
-                               metode_pembayaran, status_pembayaran, status_order)
-        VALUES (%s, NOW(), %s, %s, %s, %s)
-        """
-        cursor.execute(insert_transaksi, (
-            id_user, paket["harga"], "Non-Tunai", "Lunas", "Baru",
-        ))
-        id_transaksi = cursor.lastrowid
+#         # 🔹 Insert transaksi
+#         insert_transaksi = """
+#         INSERT INTO transaksi (id_user, tanggal_transaksi, total_harga_final, 
+#                                metode_pembayaran, status_pembayaran, status_order)
+#         VALUES (%s, NOW(), %s, %s, %s, %s)
+#         """
+#         cursor.execute(insert_transaksi, (
+#             id_user, paket["harga"], "Non-Tunai", "Lunas", "Baru",
+#         ))
+#         id_transaksi = cursor.lastrowid
 
-        # 🔹 Hitung tanggal mulai & berakhir
-        cursor.execute("SELECT CURDATE() as today")
-        today = cursor.fetchone()["today"]
-        cursor.execute("SELECT DATE_ADD(CURDATE(), INTERVAL %s DAY) as end_date", (paket["durasi"],))
-        end_date = cursor.fetchone()["end_date"]
+#         # 🔹 Hitung tanggal mulai & berakhir
+#         cursor.execute("SELECT CURDATE() as today")
+#         today = cursor.fetchone()["today"]
+#         cursor.execute("SELECT DATE_ADD(CURDATE(), INTERVAL %s DAY) as end_date", (paket["durasi"],))
+#         end_date = cursor.fetchone()["end_date"]
 
-        # 🔹 Insert ke client_virtual_office
-        insert_vo = """
-        INSERT INTO client_virtual_office (
-            id_user, id_paket_vo, id_transaksi,
-            nama, jabatan, nama_perusahaan_klien, bidang_perusahaan,
-            alamat_perusahaan, email_perusahaan, alamat_domisili, nomor_telepon,
-            tanggal_mulai, tanggal_berakhir, status_client_vo
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Aktif')
-        """
-        cursor.execute(insert_vo, (
-            id_user, id_paket_vo, id_transaksi,
-            nama, jabatan, nama_perusahaan_klien, bidang_perusahaan,
-            alamat_perusahaan, email_perusahaan, alamat_domisili, nomor_telepon,
-            today, end_date
-        ))
+#         # 🔹 Insert ke client_virtual_office
+#         insert_vo = """
+#         INSERT INTO client_virtual_office (
+#             id_user, id_paket_vo, id_transaksi,
+#             nama, jabatan, nama_perusahaan_klien, bidang_perusahaan,
+#             alamat_perusahaan, email_perusahaan, alamat_domisili, nomor_telepon,
+#             tanggal_mulai, tanggal_berakhir, status_client_vo
+#         )
+#         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Aktif')
+#         """
+#         cursor.execute(insert_vo, (
+#             id_user, id_paket_vo, id_transaksi,
+#             nama, jabatan, nama_perusahaan_klien, bidang_perusahaan,
+#             alamat_perusahaan, email_perusahaan, alamat_domisili, nomor_telepon,
+#             today, end_date
+#         ))
 
-        connection.commit()
-        return jsonify({
-            "message": "OK",
-            "id_transaksi": id_transaksi
-        }), 201
+#         connection.commit()
+#         return jsonify({
+#             "message": "OK",
+#             "id_transaksi": id_transaksi
+#         }), 201
 
-    except Exception as e:
-        if connection:
-            connection.rollback()
-            print("ERROR REGISTER VO:", str(e))
-            traceback.print_exc()  # tampilkan error detail di terminal
-        return jsonify({"message": "ERROR", "error": str(e)}), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
+#     except Exception as e:
+#         if connection:
+#             connection.rollback()
+#             print("ERROR REGISTER VO:", str(e))
+#             traceback.print_exc()  # tampilkan error detail di terminal
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor:
+#             cursor.close()
+#         if connection:
+#             connection.close()
 
 
 @virtualOffice_endpoints.route('/readDetailPaketVirtualOffice/<int:id>', methods=['GET'])

@@ -30,17 +30,23 @@ def read_kategori():
     return jsonify({"message": "OK", "datas": results}), 200
 
 
+
 @produk_endpoints.route('/readByKategori', methods=['GET'])
 def readByKategori():
     connection = get_connection()
     try:
         cursor = connection.cursor(dictionary=True)
-
         id_kategori = request.args.get('id_kategori')
+
         if id_kategori:
-            cursor.execute("SELECT * FROM produk_fnb WHERE id_kategori = %s", (id_kategori,))
+            # --- PERBAIKAN DI SINI ---
+            # Tambahkan kondisi AND untuk hanya mengambil produk yang 'Active'
+            query = "SELECT * FROM produk_fnb WHERE id_kategori = %s AND status_ketersediaan = 'Active'"
+            cursor.execute(query, (id_kategori,))
         else:
-            cursor.execute("SELECT * FROM produk_fnb")
+            # Anda juga bisa menambahkan filter di sini jika diperlukan
+            query = "SELECT * FROM produk_fnb WHERE status_ketersediaan = 'Active'"
+            cursor.execute(query)
 
         results = cursor.fetchall()
     finally:
@@ -48,6 +54,7 @@ def readByKategori():
         connection.close()
 
     return jsonify({"message": "OK", "datas": results}), 200
+
 
 
 @produk_endpoints.route('/create', methods=['POST'])
@@ -109,7 +116,8 @@ def create_transaksi_fnb():
             "datas": {
                 "id_transaksi": id_transaksi_baru,
                 "total_harga": total_harga_final,
-                "nama_pemesan": nama_guest
+                "nama_pemesan": nama_guest,
+                "detail_order": detail_order,
             }
         }), 201 # 201 Created
 

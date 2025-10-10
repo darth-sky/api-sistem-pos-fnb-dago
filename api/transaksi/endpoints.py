@@ -36,6 +36,7 @@ def get_riwayat_transaksi():
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
+        # === SOLUSI: Menggunakan GROUP_CONCAT untuk membuat string berformat JSON ===
         query = """
         SELECT 
             t.id_transaksi,
@@ -44,34 +45,70 @@ def get_riwayat_transaksi():
             t.metode_pembayaran,
             t.status_pembayaran,
             t.status_order,
+            
+            -- Booking Ruangan: Buat string yang meniru array of objects
+            (SELECT CONCAT('[', 
+                GROUP_CONCAT(
+                    JSON_OBJECT(
+                        'nama_ruangan', r.nama_ruangan,
+                        'waktu_mulai', br.waktu_mulai,
+                        'waktu_selesai', br.waktu_selesai,
+                        'durasi', br.durasi
+                    )
+                ), 
+            ']')
+            FROM booking_ruangan br JOIN ruangan r ON br.id_ruangan = r.id_ruangan WHERE br.id_transaksi = t.id_transaksi) AS bookings,
 
-            -- Booking Ruangan
-            GROUP_CONCAT(DISTINCT CONCAT('Booking Ruangan - ', r.nama_ruangan, ' (', br.durasi, ' jam)') SEPARATOR ', ') AS booking_items,
+            -- Lakukan hal yang sama untuk item lainnya
+            (SELECT CONCAT('[', 
+                GROUP_CONCAT(
+                    JSON_OBJECT(
+                        'nama_paket', pm.nama_paket,
+                        'tanggal_mulai', m.tanggal_mulai,
+                        'tanggal_berakhir', m.tanggal_berakhir
+                    )
+                ), 
+            ']')
+            FROM memberships m JOIN paket_membership pm ON m.id_paket_membership = pm.id_paket_membership WHERE m.id_transaksi = t.id_transaksi) AS memberships,
+            
+            (SELECT CONCAT('[',
+                GROUP_CONCAT(
+                    JSON_OBJECT(
+                        'nama_paket', pvo.nama_paket,
+                        'nama_perusahaan', vo.nama_perusahaan_klien,
+                        'tanggal_mulai', vo.tanggal_mulai,
+                        'tanggal_berakhir', vo.tanggal_berakhir
+                    )
+                ),
+            ']')
+            FROM client_virtual_office vo JOIN paket_virtual_office pvo ON vo.id_paket_vo = pvo.id_paket_vo WHERE vo.id_transaksi = t.id_transaksi) AS virtual_offices,
 
-            -- Membership
-            GROUP_CONCAT(DISTINCT CONCAT('Paket Membership - ', pm.nama_paket) SEPARATOR ', ') AS membership_items,
-
-            -- Virtual Office
-            GROUP_CONCAT(DISTINCT CONCAT('Paket Virtual Office - ', pvo.nama_paket) SEPARATOR ', ') AS vo_items,
-
-            -- Event Space
-            GROUP_CONCAT(DISTINCT CONCAT('Booking Event Space - ', es.nama_event_space, ' (Kapasitas: ', es.kapasitas, ' orang)') SEPARATOR ', ') AS event_space_items
+            (SELECT CONCAT('[',
+                GROUP_CONCAT(
+                    JSON_OBJECT(
+                        'nama_event', bes.nama_acara,
+                        'nama_space', es.nama_event_space,
+                        'tanggal_event', bes.tanggal_event
+                    )
+                ),
+            ']')
+            FROM booking_event bes JOIN event_spaces es ON bes.id_event_space = es.id_event_space WHERE bes.id_transaksi = t.id_transaksi) AS events
 
         FROM transaksi t
-        LEFT JOIN booking_ruangan br ON t.id_transaksi = br.id_transaksi
-        LEFT JOIN ruangan r ON br.id_ruangan = r.id_ruangan
-        LEFT JOIN memberships m ON t.id_transaksi = m.id_transaksi
-        LEFT JOIN paket_membership pm ON m.id_paket_membership = pm.id_paket_membership
-        LEFT JOIN client_virtual_office vo ON t.id_transaksi = vo.id_transaksi
-        LEFT JOIN paket_virtual_office pvo ON vo.id_paket_vo = pvo.id_paket_vo
-        LEFT JOIN booking_event bes ON t.id_transaksi = bes.id_transaksi
-        LEFT JOIN event_spaces es ON bes.id_event_space = es.id_event_space
         WHERE t.id_user = %s
         GROUP BY t.id_transaksi
         ORDER BY t.tanggal_transaksi DESC
         """
         cursor.execute(query, (user_id,))
         results = cursor.fetchall()
+        
+        # Logika parsing di Python tetap sama
+        import json
+        for row in results:
+            if row['bookings']: row['bookings'] = json.loads(row['bookings'])
+            if row['memberships']: row['memberships'] = json.loads(row['memberships'])
+            if row['virtual_offices']: row['virtual_offices'] = json.loads(row['virtual_offices'])
+            if row['events']: row['events'] = json.loads(row['events'])
 
         return jsonify({
             "message": "OK",
@@ -82,8 +119,68 @@ def get_riwayat_transaksi():
         return jsonify({"error": str(e)}), 500
 
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
+        if 'cursor' in locals() and cursor: cursor.close()
+        if 'connection' in locals() and connection: connection.close()
+
+
+# @transaksi_endpoints.route('/riwayat', methods=['GET'])
+# @jwt_required()
+# def get_riwayat_transaksi():
+#     try:
+#         identity = get_jwt_identity()
+#         user_id = identity.get("id_user")
+
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
+
+#         query = """
+#         SELECT 
+#             t.id_transaksi,
+#             t.tanggal_transaksi,
+#             t.total_harga_final,
+#             t.metode_pembayaran,
+#             t.status_pembayaran,
+#             t.status_order,
+
+#             -- Booking Ruangan
+#             GROUP_CONCAT(DISTINCT CONCAT('Booking Ruangan - ', r.nama_ruangan, ' (', br.durasi, ' jam)') SEPARATOR ', ') AS booking_items,
+
+#             -- Membership
+#             GROUP_CONCAT(DISTINCT CONCAT('Paket Membership - ', pm.nama_paket) SEPARATOR ', ') AS membership_items,
+
+#             -- Virtual Office
+#             GROUP_CONCAT(DISTINCT CONCAT('Paket Virtual Office - ', pvo.nama_paket) SEPARATOR ', ') AS vo_items,
+
+#             -- Event Space
+#             GROUP_CONCAT(DISTINCT CONCAT('Booking Event Space - ', es.nama_event_space, ' (Kapasitas: ', es.kapasitas, ' orang)') SEPARATOR ', ') AS event_space_items
+
+#         FROM transaksi t
+#         LEFT JOIN booking_ruangan br ON t.id_transaksi = br.id_transaksi
+#         LEFT JOIN ruangan r ON br.id_ruangan = r.id_ruangan
+#         LEFT JOIN memberships m ON t.id_transaksi = m.id_transaksi
+#         LEFT JOIN paket_membership pm ON m.id_paket_membership = pm.id_paket_membership
+#         LEFT JOIN client_virtual_office vo ON t.id_transaksi = vo.id_transaksi
+#         LEFT JOIN paket_virtual_office pvo ON vo.id_paket_vo = pvo.id_paket_vo
+#         LEFT JOIN booking_event bes ON t.id_transaksi = bes.id_transaksi
+#         LEFT JOIN event_spaces es ON bes.id_event_space = es.id_event_space
+#         WHERE t.id_user = %s
+#         GROUP BY t.id_transaksi
+#         ORDER BY t.tanggal_transaksi DESC
+#         """
+#         cursor.execute(query, (user_id,))
+#         results = cursor.fetchall()
+
+#         return jsonify({
+#             "message": "OK",
+#             "data": results
+#         }), 200
+
+#     except Exception as e:
+#         return jsonify({"error": str(e)}), 500
+
+#     finally:
+#         if cursor: cursor.close()
+#         if connection: connection.close()
 
 # @transaksi_endpoints.route('/riwayat', methods=['GET'])
 # @jwt_required()

@@ -38,6 +38,7 @@ def get_membership_detail(id):
             pm.durasi,
             pm.kuota,
             pm.deskripsi_benefit,
+            pm.fitur_membership,
             kr.nama_kategori
         FROM paket_membership pm
         JOIN kategori_ruangan kr ON kr.id_kategori_ruangan = pm.id_kategori_ruangan
@@ -85,10 +86,9 @@ def get_membership_by_user(id_user):
         if cursor: cursor.close()
         if connection: connection.close()
 
-
 @memberships_endpoints.route('/readMemberships', methods=['GET'])
 def readMembership():
-    """Ambil daftar paket membership + kategori ruangan"""
+    """Ambil daftar paket membership + kategori ruangan YANG AKTIF""" # Deskripsi diperjelas
     connection = None
     cursor = None
     try:
@@ -103,11 +103,13 @@ def readMembership():
             pm.durasi,
             pm.kuota,
             pm.deskripsi_benefit,
+            pm.fitur_membership,
             kr.id_kategori_ruangan,
             kr.nama_kategori
         FROM paket_membership pm
         JOIN kategori_ruangan kr 
             ON pm.id_kategori_ruangan = kr.id_kategori_ruangan
+        WHERE pm.status_paket = 'Active' -- ✅ PERUBAHAN: Tambahkan baris ini
         """
         cursor.execute(query)
         results = cursor.fetchall()
@@ -121,6 +123,8 @@ def readMembership():
         if connection:
             connection.close()
             
+            
+                        
 # @memberships_endpoints.route('/readMembershipsById/<int:id>', methods=['GET'])
 # def get_membership_detail(id):
 #     try:
