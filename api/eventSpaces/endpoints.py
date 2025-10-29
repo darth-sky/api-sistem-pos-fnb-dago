@@ -72,11 +72,11 @@ def create_booking():
 
         # 1. Buat transaksi baru
         insert_transaksi = """
-            INSERT INTO transaksi (id_user, total_harga_final, tanggal_transaksi)
-            VALUES (%s, %s, %s)
+            INSERT INTO transaksi (id_user, total_harga_final, tanggal_transaksi, status_pembayaran, status_order)
+            VALUES (%s, %s, %s, %s, %s)
         """
         cursor.execute(insert_transaksi,
-                       (data["id_user"], 0, datetime.datetime.now()))
+                        (data["id_user"], 0, datetime.datetime.now(), 'Belum Lunas', 'Baru'))
         connection.commit()
         transaksi_id = cursor.lastrowid
 
@@ -127,3 +127,4 @@ def create_booking():
             cursor.close()
         if 'connection' in locals():
             connection.close()
+            

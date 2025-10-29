@@ -388,3 +388,383 @@ def getFnBDashboardData():
         if connection: connection.close()
 
 
+# owner_endpoints.py
+from flask import Blueprint, jsonify, request
+from helper.db_helper import get_connection
+from datetime import datetime, timedelta
+
+owner_endpoints = Blueprint('owner_endpoints', __name__)
+
+# ---------------- helpers ----------------
+def _parse_date(v):
+    if not v:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(v, fmt).date()
+        except Exception:
+            pass
+    return None
+
+def _req_range():
+    """
+    Ambil start_date & end_date dari query string.
+    Wajib ada, format fleksibel (YYYY-MM-DD atau DD-MM-YYYY).
+    """
+    start = _parse_date(request.args.get("start_date"))
+    end   = _parse_date(request.args.get("end_date"))
+    return start, end
+
+# -------------- DASHBOARD SUMMARY (endpoint utama) ----------------
+@owner_endpoints.route('/dashboard/summary', methods=['GET'])
+def dashboard_summary():
+    start_date, end_date = _req_range()
+    if not start_date or not end_date:
+        return jsonify({"message": "Error", "error": "Parameter start_date & end_date wajib (YYYY-MM-DD)."}), 400
+
+    connection, cursor = None, None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # ===================== 1) TOTALS =====================
+        # a) Total F&B (sum detail) dalam range
+        q_total_fnb = """
+            SELECT COALESCE(SUM(dof.jumlah * dof.harga_saat_order), 0) AS total_fnb
+            FROM detail_order_fnb dof
+            JOIN transaksi t ON t.id_transaksi = dof.id_transaksi
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+        """
+        cursor.execute(q_total_fnb, (start_date, end_date))
+        total_fnb = float(cursor.fetchone()["total_fnb"])
+
+        # b) Total Working Space (agregasi per transaksi untuk hindari duplikasi)
+        q_total_ws = """
+            SELECT COALESCE(SUM(x.total_transaksi), 0) AS total_ws
+            FROM (
+                SELECT t.id_transaksi, MAX(t.total_harga_final) AS total_transaksi
+                FROM booking_ruangan br
+                JOIN transaksi t ON t.id_transaksi = br.id_transaksi
+                WHERE t.status_pembayaran = 'Lunas'
+                  AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+                GROUP BY t.id_transaksi
+            ) x
+        """
+        cursor.execute(q_total_ws, (start_date, end_date))
+        total_ws = float(cursor.fetchone()["total_ws"])
+
+        total_sales = total_fnb + total_ws
+
+        # c) Jumlah transaksi (lunas) dalam range (pengunjung ≈ transaksi)
+        q_total_trans = """
+            SELECT COUNT(*) AS total_transactions
+            FROM transaksi t
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+        """
+        cursor.execute(q_total_trans, (start_date, end_date))
+        total_transactions = int(cursor.fetchone()["total_transactions"])
+
+        # d) total days & avg harian
+        total_days = (end_date - start_date).days + 1
+        total_days = max(total_days, 1)
+        avg_daily = total_sales / total_days if total_days else 0
+
+        totals = {
+            "total_fnb": total_fnb,
+            "total_ws": total_ws,
+            "total_sales": total_sales,
+            "total_transactions": total_transactions,
+            "avg_daily": avg_daily,
+            "total_days": total_days
+        }
+
+        # =============== 2) DAILY SALES (FNB vs WS) ===============
+        # FNB per hari
+        q_fnb_daily = """
+            SELECT DATE(t.tanggal_transaksi) AS tanggal,
+                   SUM(dof.jumlah * dof.harga_saat_order) AS fnb
+            FROM transaksi t
+            JOIN detail_order_fnb dof ON t.id_transaksi = dof.id_transaksi
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+            GROUP BY DATE(t.tanggal_transaksi)
+        """
+        cursor.execute(q_fnb_daily, (start_date, end_date))
+        fnb_rows = cursor.fetchall()
+        fnb_map = { r["tanggal"]: float(r["fnb"] or 0) for r in fnb_rows }
+
+        # WS per hari (agregasi per transaksi)
+        q_ws_daily = """
+            SELECT dt.tanggal, SUM(dt.total_transaksi) AS ws
+            FROM (
+                SELECT DATE(t.tanggal_transaksi) AS tanggal,
+                       t.id_transaksi,
+                       MAX(t.total_harga_final) AS total_transaksi
+                FROM booking_ruangan br
+                JOIN transaksi t ON t.id_transaksi = br.id_transaksi
+                WHERE t.status_pembayaran = 'Lunas'
+                  AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+                GROUP BY DATE(t.tanggal_transaksi), t.id_transaksi
+            ) dt
+            GROUP BY dt.tanggal
+        """
+        cursor.execute(q_ws_daily, (start_date, end_date))
+        ws_rows = cursor.fetchall()
+        ws_map = { r["tanggal"]: float(r["ws"] or 0) for r in ws_rows }
+
+        # gabungkan jadi list lengkap setiap hari di range
+        daily_sales = []
+        it = start_date
+        while it <= end_date:
+            f = fnb_map.get(it, 0.0)
+            w = ws_map.get(it, 0.0)
+            daily_sales.append({
+                "tanggal": it.isoformat(),
+                "fnb": f,
+                "ws": w,
+                "all": f + w
+            })
+            it += timedelta(days=1)
+
+        # ======= 3) VISITORS BY HOUR (jumlah transaksi per jam) =======
+        q_visitors_by_hour = """
+            SELECT HOUR(t.tanggal_transaksi) AS hour, COUNT(*) AS count
+            FROM transaksi t
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+            GROUP BY HOUR(t.tanggal_transaksi)
+            ORDER BY hour
+        """
+        cursor.execute(q_visitors_by_hour, (start_date, end_date))
+        visitors_by_hour = [
+            {"hour": int(r["hour"]), "count": int(r["count"])}
+            for r in cursor.fetchall()
+        ]
+
+        # ======= 4) BOOKINGS BY HOUR (estimasi: pakai jam transaksi booking) =======
+        # Jika kamu punya kolom jam_mulai/jam_selesai di booking_ruangan, ganti agregasi ini
+        q_bookings_by_hour = """
+            SELECT HOUR(t.tanggal_transaksi) AS hour, COUNT(*) AS count
+            FROM booking_ruangan br
+            JOIN transaksi t ON t.id_transaksi = br.id_transaksi
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+            GROUP BY HOUR(t.tanggal_transaksi)
+            ORDER BY hour
+        """
+        cursor.execute(q_bookings_by_hour, (start_date, end_date))
+        bookings_by_hour = [
+            {"hour": int(r["hour"]), "count": int(r["count"])}
+            for r in cursor.fetchall()
+        ]
+
+        # ================= 5) TOP FNB & TOP WS =================
+        q_top_fnb = """
+            SELECT 
+                COALESCE(pf.nama_produk, 'Produk Tidak Ditemukan') AS item,
+                SUM(dof.jumlah) AS qty,
+                SUM(dof.jumlah * dof.harga_saat_order) AS total
+            FROM detail_order_fnb dof
+            LEFT JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+            JOIN transaksi t ON t.id_transaksi = dof.id_transaksi
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+            GROUP BY pf.nama_produk
+            ORDER BY qty DESC
+            LIMIT 10
+        """
+        cursor.execute(q_top_fnb, (start_date, end_date))
+        top_fnb = [
+            {"item": r["item"], "qty": float(r["qty"] or 0), "total": float(r["total"] or 0)}
+            for r in cursor.fetchall()
+        ]
+
+        q_top_ws = """
+            SELECT 
+                r.nama_ruangan AS item,
+                COUNT(DISTINCT br.id_booking) AS qty,
+                SUM(x.total_transaksi) AS total
+            FROM booking_ruangan br
+            JOIN ruangan r ON br.id_ruangan = r.id_ruangan
+            JOIN (
+                SELECT t.id_transaksi, MAX(t.total_harga_final) AS total_transaksi
+                FROM transaksi t
+                WHERE t.status_pembayaran = 'Lunas'
+                  AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+                GROUP BY t.id_transaksi
+            ) x ON x.id_transaksi = br.id_transaksi
+            GROUP BY r.nama_ruangan
+            ORDER BY total DESC
+            LIMIT 5
+        """
+        cursor.execute(q_top_ws, (start_date, end_date))
+        top_ws = [
+            {"item": r["item"], "qty": float(r["qty"] or 0), "total": float(r["total"] or 0)}
+            for r in cursor.fetchall()
+        ]
+
+        # ================== RESPON ==================
+        return jsonify({
+            "message": "OK",
+            "datas": {
+                "totals": totals,
+                "daily_sales": daily_sales,
+                "visitors_by_hour": visitors_by_hour,
+                "bookings_by_hour": bookings_by_hour,
+                "top_fnb": top_fnb,
+                "top_ws": top_ws
+            }
+        }), 200
+
+    except Exception as e:
+        print(f"[dashboard_summary] error: {e}")
+        return jsonify({"message": "Error", "error": str(e)}), 500
+    finally:
+        if cursor:
+            try: cursor.close()
+            except: pass
+        if connection:
+            try: connection.close()
+            except: pass
+            
+
+
+TENANT_HOME_BRO = 3
+TENANT_DAPOER_MS = 4
+
+# ⬇️ TANPA leading slash + tambahkan OPTIONS
+@owner_endpoints.route("/ownerfnb", methods=["GET", "OPTIONS"])
+def ownerfnb_dashboard():
+    # ⬇️ balas dulu preflight
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    start_date = request.args.get('start_date')
+    end_date   = request.args.get('end_date')
+    if not start_date or not end_date:
+        return jsonify({"message": "Error", "error": "start_date & end_date wajib (YYYY-MM-DD)."}), 400
+
+    conn = None
+    cur  = None
+    try:
+        conn = get_connection()
+        cur  = conn.cursor(dictionary=True)
+
+        # ---------- 1) TOTALS ----------
+        totals_sql = """
+        SELECT
+            COALESCE(SUM(dof.jumlah * dof.harga_saat_order), 0) AS total_fnb,
+            COUNT(DISTINCT t.id_transaksi) AS total_transactions,
+            DATEDIFF(%s, %s) + 1 AS total_days
+        FROM detail_order_fnb dof
+        JOIN transaksi t ON t.id_transaksi = dof.id_transaksi
+        WHERE DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+          AND t.status_pembayaran = 'Lunas';
+        """
+        cur.execute(totals_sql, (end_date, start_date, start_date, end_date))
+        tr = cur.fetchone() or {}
+        total_fnb  = int(tr.get("total_fnb") or 0)
+        total_tx   = int(tr.get("total_transactions") or 0)
+        total_days = int(tr.get("total_days") or 1)
+        avg_daily  = round(total_fnb / max(1, total_days))
+
+        # ---------- 2) DAILY SELLING PER TENANT ----------
+        daily_sql = """
+        SELECT
+            DATE(t.tanggal_transaksi) AS tanggal,
+            kp.id_tenant,
+            SUM(dof.jumlah * dof.harga_saat_order) AS total_harian
+        FROM detail_order_fnb dof
+        JOIN transaksi t ON t.id_transaksi = dof.id_transaksi
+        JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+        JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
+        WHERE DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+          AND t.status_pembayaran = 'Lunas'
+        GROUP BY tanggal, kp.id_tenant
+        ORDER BY tanggal ASC;
+        """
+        cur.execute(daily_sql, (start_date, end_date))
+        rows = cur.fetchall() or []
+        daily_map = {}
+        for r in rows:
+            key = r['tanggal'].isoformat() if hasattr(r['tanggal'], 'isoformat') else str(r['tanggal'])
+            if key not in daily_map:
+                daily_map[key] = {"tanggal": key, "dapoerms": 0, "homebro": 0}
+            if r['id_tenant'] == TENANT_DAPOER_MS:
+                daily_map[key]["dapoerms"] = int(r['total_harian'] or 0)
+            elif r['id_tenant'] == TENANT_HOME_BRO:
+                daily_map[key]["homebro"] = int(r['total_harian'] or 0)
+        daily_selling = sorted(daily_map.values(), key=lambda x: x["tanggal"])
+
+        # ---------- 3) VISITORS PER HOUR ----------
+        visitors_sql = """
+        SELECT
+            HOUR(t.tanggal_transaksi) AS hour,
+            COUNT(DISTINCT t.id_transaksi) AS cnt
+        FROM transaksi t
+        JOIN detail_order_fnb dof ON dof.id_transaksi = t.id_transaksi
+        WHERE DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+          AND t.status_pembayaran = 'Lunas'
+        GROUP BY hour
+        ORDER BY hour;
+        """
+        cur.execute(visitors_sql, (start_date, end_date))
+        vrows = cur.fetchall() or []
+        visitors_by_hour = [{"hour": int(r["hour"]), "count": int(r["cnt"])} for r in vrows]
+
+        # ---------- 4) PEAK HOURS ----------
+        peak_by_hour = visitors_by_hour
+
+        # ---------- 5) TOP 5 PRODUCT per TENANT ----------
+        top_sql = """
+        SELECT
+            pf.nama_produk AS item,
+            SUM(dof.jumlah) AS qty,
+            SUM(dof.jumlah * dof.harga_saat_order) AS total
+        FROM detail_order_fnb dof
+        JOIN transaksi t ON t.id_transaksi = dof.id_transaksi
+        JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+        JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
+        WHERE DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+          AND t.status_pembayaran = 'Lunas'
+          AND kp.id_tenant = %s
+        GROUP BY pf.nama_produk
+        ORDER BY total DESC
+        LIMIT 5;
+        """
+        cur.execute(top_sql, (start_date, end_date, TENANT_DAPOER_MS))
+        top_dapoer = [{"item": r["item"], "qty": int(r["qty"] or 0), "total": int(r["total"] or 0)} for r in (cur.fetchall() or [])]
+        cur.execute(top_sql, (start_date, end_date, TENANT_HOME_BRO))
+        top_home = [{"item": r["item"], "qty": int(r["qty"] or 0), "total": int(r["total"] or 0)} for r in (cur.fetchall() or [])]
+
+        return jsonify({
+            "message": "OK",
+            "datas": {
+                "totals": {
+                    "total_fnb": total_fnb,
+                    "total_ws": 0,
+                    "total_sales": total_fnb,
+                    "total_transactions": total_tx,
+                    "avg_daily": avg_daily,
+                    "total_days": total_days
+                },
+                "daily_selling_per_tenant": daily_selling,
+                "visitors_by_hour": visitors_by_hour,
+                "peak_by_hour": peak_by_hour,
+                "top_fnb": { "dapoer": top_dapoer, "home": top_home }
+            }
+        }), 200
+
+    except Exception as e:
+        print("ownerfnb_dashboard error:", e)
+        return jsonify({"message": "Error", "error": str(e)}), 500
+    finally:
+        if cur:
+            try: cur.close()
+            except: pass
+        if conn:
+            try: conn.close()
+            except: pass
+            

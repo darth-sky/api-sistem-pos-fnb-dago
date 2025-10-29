@@ -208,10 +208,11 @@ def getMembershipDetail(user_id):
         if connection:
             connection.close()
 
+
 @memberships_endpoints.route('/readMembershipsByUser', methods=['GET'])
 @jwt_required()
 def read_memberships_by_users():
-    """Ambil membership user berdasarkan token"""
+    """Ambil membership user beserta riwayat penggunaan kreditnya"""
     connection = None
     cursor = None
     try:
@@ -223,33 +224,36 @@ def read_memberships_by_users():
 
         query = """
         SELECT 
-            m.id_memberships,
-            m.id_user,
-            m.id_paket_membership,
-            m.id_transaksi,
-            m.tanggal_mulai,
-            m.tanggal_berakhir,
-            m.total_credit,
-            m.sisa_credit,
-            m.status_memberships,
-            pm.nama_paket,
-            pm.harga,
-            pm.durasi,
-            pm.kuota,
-            pm.deskripsi_benefit,
-            kr.id_kategori_ruangan,
+            m.id_memberships, m.tanggal_mulai, m.tanggal_berakhir,
+            m.total_credit, m.sisa_credit, m.status_memberships,
+            pm.id_paket_membership, pm.nama_paket, pm.kuota,
             kr.nama_kategori
         FROM memberships m
-        JOIN paket_membership pm 
-            ON m.id_paket_membership = pm.id_paket_membership
-        JOIN kategori_ruangan kr 
-            ON pm.id_kategori_ruangan = kr.id_kategori_ruangan
-        WHERE m.id_user = %s
+        JOIN paket_membership pm ON m.id_paket_membership = pm.id_paket_membership
+        JOIN kategori_ruangan kr ON pm.id_kategori_ruangan = kr.id_kategori_ruangan
+        WHERE m.id_user = %s AND m.status_memberships = 'Active'
+        ORDER BY m.tanggal_berakhir DESC;
         """
         cursor.execute(query, (id_user,))
-        results = cursor.fetchall()
+        memberships = cursor.fetchall()
 
-        return jsonify({"message": "OK", "datas": results}), 200
+        for membership in memberships:
+            # PERBAIKAN DI SINI: Gunakan satu '%' agar MySQL memformat tanggalnya
+            query_history = """
+                SELECT 
+                    DATE_FORMAT(br.waktu_mulai, '%d %M %Y') AS tanggal,
+                    CONCAT('Booking ', r.nama_ruangan, ' (-', br.kredit_terpakai, ' kredit)') AS deskripsi
+                FROM booking_ruangan br
+                JOIN ruangan r ON br.id_ruangan = r.id_ruangan
+                WHERE br.id_memberships = %s AND br.kredit_terpakai > 0
+                ORDER BY br.waktu_mulai DESC;
+            """
+            cursor.execute(query_history, (membership['id_memberships'],))
+            history_data = cursor.fetchall()
+            membership['riwayat'] = history_data
+
+        return jsonify({"message": "OK", "datas": memberships}), 200
+        
     except Exception as e:
         print("Error:", e)
         return jsonify({"message": "ERROR", "error": str(e)}), 500
@@ -258,6 +262,57 @@ def read_memberships_by_users():
             cursor.close()
         if connection:
             connection.close()
+
+# @memberships_endpoints.route('/readMembershipsByUser', methods=['GET'])
+# @jwt_required()
+# def read_memberships_by_users():
+#     """Ambil membership user berdasarkan token"""
+#     connection = None
+#     cursor = None
+#     try:
+#         identity = get_jwt_identity()
+#         id_user = identity.get('id_user')
+
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
+
+#         query = """
+#         SELECT 
+#             m.id_memberships,
+#             m.id_user,
+#             m.id_paket_membership,
+#             m.id_transaksi,
+#             m.tanggal_mulai,
+#             m.tanggal_berakhir,
+#             m.total_credit,
+#             m.sisa_credit,
+#             m.status_memberships,
+#             pm.nama_paket,
+#             pm.harga,
+#             pm.durasi,
+#             pm.kuota,
+#             pm.deskripsi_benefit,
+#             kr.id_kategori_ruangan,
+#             kr.nama_kategori
+#         FROM memberships m
+#         JOIN paket_membership pm 
+#             ON m.id_paket_membership = pm.id_paket_membership
+#         JOIN kategori_ruangan kr 
+#             ON pm.id_kategori_ruangan = kr.id_kategori_ruangan
+#         WHERE m.id_user = %s
+#         """
+#         cursor.execute(query, (id_user,))
+#         results = cursor.fetchall()
+
+#         return jsonify({"message": "OK", "datas": results}), 200
+#     except Exception as e:
+#         print("Error:", e)
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor:
+#             cursor.close()
+#         if connection:
+#             connection.close()
 
 
 

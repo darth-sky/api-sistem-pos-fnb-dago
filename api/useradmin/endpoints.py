@@ -7,6 +7,9 @@ from flask_jwt_extended import jwt_required
 from helper.year_operation import diff_year
 from helper.year_operation import check_age_book
 from werkzeug.utils import secure_filename
+from flask_bcrypt import Bcrypt
+
+bcrypt = Bcrypt()
 
 useradmin_endpoints = Blueprint("useradmin_endpoints", __name__)
 

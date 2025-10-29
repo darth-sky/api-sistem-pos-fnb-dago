@@ -300,3 +300,21 @@ def deleteKategori(id_kategori):
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
+
+
+@produkadmin_endpoints.route('/tenants', methods=['GET'])
+def get_all_tenants_for_dropdown():
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        # Query sederhana untuk mengambil semua tenant
+        cursor.execute("SELECT id_tenant, nama_tenant FROM tenants ORDER BY nama_tenant ASC")
+        tenants = cursor.fetchall()
+        return jsonify({"message": "OK", "datas": tenants}), 200
+    except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()

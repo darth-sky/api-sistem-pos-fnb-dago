@@ -2,7 +2,8 @@
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import create_access_token, decode_token
 from flask_bcrypt import Bcrypt
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt, get_jwt_identity
+
 
 from helper.db_helper import get_connection
 

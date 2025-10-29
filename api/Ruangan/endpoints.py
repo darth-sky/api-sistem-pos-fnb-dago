@@ -1,20 +1,514 @@
 """Routes for module ruangan"""
 import os
+import sys
 from flask import Blueprint, jsonify, request
+import pytz
 from helper.db_helper import get_connection
 from helper.form_validation import get_form_data
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt_identity
 from helper.year_operation import diff_year
 from helper.year_operation import check_age_book
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import math
 import traceback
 from datetime import datetime # --- PERUBAHAN 1: Impor library datetime ---
+from mysql.connector import Error as DbError
 
 ruangan_endpoints = Blueprint('ruangan', __name__)
 UPLOAD_FOLDER = "img"
 
-# event
+@ruangan_endpoints.route('/private-office-rooms', methods=['GET'])
+def get_private_office_rooms():
+    """
+    Mengambil semua ruangan aktif, digabungkan dengan kategori dan paket harganya,
+    untuk halaman pemesanan bulk/tim.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. Ambil semua ruangan aktif beserta nama kategorinya
+        query_rooms = """
+        SELECT 
+            r.id_ruangan, 
+            r.nama_ruangan, 
+            r.harga_per_jam, 
+            r.kapasitas, 
+            r.gambar_ruangan, 
+            r.fitur_ruangan, 
+            kr.nama_kategori
+        FROM ruangan r
+        JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan
+        WHERE r.status_ketersediaan = 'Active'
+        ORDER BY kr.nama_kategori, r.nama_ruangan;
+        """
+        cursor.execute(query_rooms)
+        rooms = cursor.fetchall()
+
+        # 2. Ambil paket harga untuk setiap ruangan
+        # (Ini lebih efisien daripada JOIN N-N)
+        query_paket = "SELECT id_paket, durasi_jam, harga_paket FROM paket_harga_ruangan WHERE id_ruangan = %s"
+        
+        for room in rooms:
+            cursor.execute(query_paket, (room['id_ruangan'],))
+            room['paket_harga'] = cursor.fetchall()
+
+        return jsonify(rooms), 200
+
+    except Exception as e:
+        print(f"Error pada /private-office-rooms: {e}")
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()
+
+@ruangan_endpoints.route('/bookRuanganBulk', methods=['POST'])
+@jwt_required()
+def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
+    """
+    Membuat transaksi & booking untuk BANYAK ruangan sekaligus,
+    dengan MEMECAH menjadi booking harian (tanpa timezone).
+    """
+    connection = None
+    cursor = None
+    try:
+        data = request.json
+        identity = get_jwt_identity()
+
+        # --- Proses ID User (Tetap Sama) ---
+        try:
+            if isinstance(identity, dict):
+                 id_user = identity.get('id_user')
+                 if id_user is None: raise ValueError("Key 'id_user' missing.")
+            else: id_user = identity
+            # id_user = int(id_user) # Opsional
+        except (TypeError, ValueError, AttributeError) as e:
+            return jsonify({"message": "ERROR", "error": f"Invalid token identity: {e}"}), 400
+        if id_user is None: return jsonify({"message": "ERROR", "error": "User ID missing."}), 400
+        # --- End Proses ID User ---
+
+        # --- Ambil Data Format BARU dari Frontend ---
+        room_ids = data.get("room_ids")
+        tanggal_mulai_str = data.get("tanggal_mulai")
+        tanggal_selesai_str = data.get("tanggal_selesai")
+        jam_mulai_int = data.get("jam_mulai")
+        jam_selesai_int = data.get("jam_selesai")
+        metode_pembayaran = data.get("metode_pembayaran", "Non-Tunai")
+        status_pembayaran = data.get("status_pembayaran", "Belum Lunas")
+
+        # Validasi Input Dasar
+        if not all([room_ids, tanggal_mulai_str, tanggal_selesai_str, isinstance(jam_mulai_int, int), isinstance(jam_selesai_int, int)]):
+            return jsonify({"message": "ERROR", "error": "Data input tidak lengkap atau format jam salah."}), 400
+        if jam_selesai_int <= jam_mulai_int:
+             return jsonify({"message": "ERROR", "error": "Jam selesai harus setelah jam mulai."}), 400
+
+        try:
+            tanggal_mulai_date = datetime.strptime(tanggal_mulai_str, "%Y-%m-%d").date()
+            tanggal_selesai_date = datetime.strptime(tanggal_selesai_str, "%Y-%m-%d").date()
+            if tanggal_selesai_date < tanggal_mulai_date:
+                raise ValueError("Tanggal selesai tidak boleh sebelum tanggal mulai.")
+        except ValueError as e:
+             return jsonify({"message": "ERROR", "error": f"Format tanggal salah: {e}"}), 400
+        # --- End Ambil Data ---
+
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        connection.start_transaction()
+
+        total_harga_transaksi = 0
+        parsed_bookings_daily = [] # List untuk menampung booking harian
+
+        # Ambil detail harga semua ruangan yang relevan sekali saja
+        placeholders = ','.join(['%s'] * len(room_ids))
+        cursor.execute(f"SELECT id_ruangan, nama_ruangan, harga_per_jam FROM ruangan WHERE id_ruangan IN ({placeholders})", tuple(room_ids))
+        room_details = {room['id_ruangan']: room for room in cursor.fetchall()}
+
+        if len(room_details) != len(set(room_ids)): # Pastikan semua ID valid
+             missing_ids = set(room_ids) - set(room_details.keys())
+             raise ValueError(f"Satu atau lebih ID ruangan tidak ditemukan: {missing_ids}")
+
+        # --- TAHAP 1: VALIDASI PER HARI & KALKULASI HARGA ---
+        current_date_check = tanggal_mulai_date
+        while current_date_check <= tanggal_selesai_date:
+            waktu_mulai_dt = datetime.combine(current_date_check, datetime.min.time()).replace(hour=jam_mulai_int)
+            # Penting: Jika jam selesai adalah 0 (tengah malam), itu berarti akhir hari SEBELUMNYA.
+            # Namun, karena inputnya jam (misal 17), kita tetap di hari yang sama.
+            waktu_selesai_dt = datetime.combine(current_date_check, datetime.min.time()).replace(hour=jam_selesai_int)
+
+            # Jika waktu selesai melintasi tengah malam (misal 22:00 - 02:00), perlu penyesuaian
+            # Untuk kasus 08:00 - 17:00, ini tidak relevan, tapi baik untuk kasus lain.
+            if waktu_selesai_dt <= waktu_mulai_dt:
+                 # Jika waktu selesai <= waktu mulai, anggap selesai di HARI BERIKUTNYA
+                 waktu_selesai_dt += timedelta(days=1)
+                 # Tapi jika input tanggal selesai == tanggal mulai, ini tidak valid
+                 if tanggal_selesai_date == tanggal_mulai_date and len(room_ids) * (tanggal_selesai_date - tanggal_mulai_date + timedelta(days=1)).days == 1 : # Hanya satu hari booking
+                      raise ValueError("Untuk booking satu hari, jam selesai harus setelah jam mulai di hari yang sama.")
+                 # Jika multi-hari, dan ini adalah hari terakhir, jangan tambahkan hari di waktu selesai
+                 elif current_date_check == tanggal_selesai_date:
+                      waktu_selesai_dt -= timedelta(days=1) # Kembalikan ke hari ini, asumsi maks jam 23:59 atau sesuai aturan bisnis
+
+            # --- Konversi ke string format DB untuk query ---
+            waktu_mulai_db_str = waktu_mulai_dt.strftime('%Y-%m-%d %H:%M:%S')
+            waktu_selesai_db_str = waktu_selesai_dt.strftime('%Y-%m-%d %H:%M:%S')
+
+            for room_id in room_ids:
+                # Validasi ketersediaan untuk HARI INI, RUANGAN INI
+                check_query = "SELECT id_booking FROM booking_ruangan WHERE id_ruangan = %s AND (waktu_mulai < %s AND waktu_selesai > %s)"
+                cursor.execute(check_query, (room_id, waktu_selesai_db_str, waktu_mulai_db_str))
+                if cursor.fetchone():
+                    connection.rollback()
+                    room_name = room_details.get(room_id, {}).get('nama_ruangan', f'ID {room_id}')
+                    return jsonify({"message": "ERROR", "error": f"Slot untuk {room_name} pada {current_date_check.strftime('%d-%m-%Y')} jam {jam_mulai_int}:00 - {jam_selesai_int}:00 sudah terisi."}), 409
+
+                # Kalkulasi durasi & harga untuk HARI INI
+                room_info = room_details[room_id]
+                harga_per_jam = room_info['harga_per_jam']
+                if harga_per_jam is None: raise ValueError(f"Harga per jam untuk {room_info['nama_ruangan']} tidak valid.")
+
+                durasi_detik_hari_ini = (waktu_selesai_dt - waktu_mulai_dt).total_seconds()
+                durasi_jam_hitung_hari_ini = (durasi_detik_hari_ini + 3599) // 3600
+                if durasi_jam_hitung_hari_ini == 0: durasi_jam_hitung_hari_ini = 1
+                durasi_menit_simpan_hari_ini = int(durasi_detik_hari_ini / 60)
+
+                harga_booking_hari_ini = durasi_jam_hitung_hari_ini * harga_per_jam
+                total_harga_transaksi += harga_booking_hari_ini
+
+                # Tambahkan ke list booking harian
+                parsed_bookings_daily.append({
+                    "id_ruangan": room_id,
+                    "waktu_mulai_str": waktu_mulai_db_str,
+                    "waktu_selesai_str": waktu_selesai_db_str,
+                    "durasi_menit": durasi_menit_simpan_hari_ini
+                })
+
+            current_date_check += timedelta(days=1) # Pindah ke hari berikutnya
+
+        # --- TAHAP 2: BUAT 1 TRANSAKSI INDUK ---
+        insert_transaksi = """
+        INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        status_order = "Baru"
+        cursor.execute(insert_transaksi, (id_user, int(round(total_harga_transaksi)), metode_pembayaran, status_pembayaran, status_order))
+        id_transaksi_baru = cursor.lastrowid
+
+        # --- TAHAP 3: MASUKKAN SEMUA BOOKING HARIAN ---
+        insert_booking_query = """
+        INSERT INTO booking_ruangan (id_transaksi, id_ruangan, waktu_mulai, waktu_selesai, durasi, kredit_terpakai)
+        VALUES (%s, %s, %s, %s, %s, 0)
+        """
+        for b in parsed_bookings_daily:
+            cursor.execute(insert_booking_query, (
+                id_transaksi_baru,
+                b['id_ruangan'],
+                b['waktu_mulai_str'], # Kirim string
+                b['waktu_selesai_str'],# Kirim string
+                b['durasi_menit']
+            ))
+
+        # Jika semua berhasil, commit
+        connection.commit()
+
+        return jsonify({
+            "message": f"Pesanan bulk booking untuk {len(room_ids)} ruangan selama {(tanggal_selesai_date - tanggal_mulai_date).days + 1} hari berhasil dibuat.",
+            "id_transaksi": id_transaksi_baru,
+            "total_harga": int(round(total_harga_transaksi))
+        }), 201
+
+    except ValueError as ve:
+        if connection: connection.rollback()
+        print(f"Validation Error: {ve}")
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(ve)}), 400
+    except Exception as e:
+        if connection: connection.rollback()
+        print(f"Unexpected Error: {e}")
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal pada server."}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()
+        
+        
+
+
+
+
+
+
+
+
+
+
+
+def check_room_availability(cursor, room_id, start_time_utc, end_time_utc):
+    """
+    (PLACEHOLDER - GANTI DENGAN LOGIKA ANDA)
+    Memeriksa apakah ruangan tersedia dalam rentang waktu tertentu.
+    Harus mengembalikan True jika tersedia, False jika tidak.
+    """
+    # Contoh Query Sederhana (HARUS DISESUAIKAN):
+    query = """
+        SELECT COUNT(*) as conflicts
+        FROM booking_ruangan
+        WHERE id_ruangan = %s
+          AND (
+            (%s < waktu_selesai AND %s > waktu_mulai) -- Ada overlap
+          )
+          AND id_transaksi NOT IN (SELECT id_transaksi FROM transaksi WHERE status_pembayaran = 'Dibatalkan') -- Abaikan yang dibatalkan
+    """
+    try:
+        cursor.execute(query, (room_id, start_time_utc, end_time_utc))
+        result = cursor.fetchone()
+        # Jika fetchone() mengembalikan None atau 'conflicts' tidak ada, anggap error/tidak tersedia
+        if result is None or 'conflicts' not in result:
+             print(f"--- DEBUG Availability Check: Error fetching conflicts for room {room_id}")
+             return False # Atau lemparkan exception
+        print(f"--- DEBUG Availability Check: Room {room_id} conflicts found: {result['conflicts']}")
+        return result['conflicts'] == 0 # Tersedia jika tidak ada konflik
+    except Exception as e:
+        print(f"--- DEBUG Availability Check: DB Error checking room {room_id}: {e}")
+        # Sebaiknya lemparkan exception di sini agar transaksi dibatalkan
+        raise DbError(f"Database error saat memeriksa ketersediaan: {e}") # Import DbError dari mysql.connector.errors
+
+
+# --- Endpoint Utama dengan Perbaikan & Debugging ---
+@ruangan_endpoints.route('/createBulk', methods=['POST'])
+@jwt_required()
+def create_bulk_booking():
+    print("\n--- DEBUG: >>> ENTERED create_bulk_booking function <<< ---")
+    """
+    Endpoint untuk membuat multiple booking ruangan (Private Office style)
+    oleh pengguna yang sudah login.
+    """
+    
+    connection = None
+    cursor_dict = None # Cursor dictionary untuk check_availability
+    cursor_normal_trans = None # Cursor normal untuk insert transaksi
+    cursor_normal_book = None # Cursor normal untuk insert booking
+
+    print("\n--- DEBUG: Incoming request to /createBulk ---") # Tanda mulai request
+
+    try:
+        # 1. Ambil ID User dari Token JWT
+        current_user = get_jwt_identity()
+        print(f"--- DEBUG: JWT Identity Received: {current_user}")
+
+        # Pastikan identity adalah dictionary
+        if not isinstance(current_user, dict):
+             print("--- DEBUG: ERROR - JWT identity is not a dictionary.")
+             return jsonify({"message": "ERROR", "error": "Format token tidak sesuai."}), 401
+
+        id_user_login = current_user.get('id_user')
+        print(f"--- DEBUG: Extracted User ID from token: {id_user_login}")
+
+        if not id_user_login:
+            print("--- DEBUG: ERROR - User ID ('id_user') not found in token identity.")
+            return jsonify({"message": "ERROR", "error": "Informasi pengguna ('id_user') tidak ditemukan dalam token."}), 401
+
+        # 2. Ambil & Cetak Data dari Request Body
+        data = request.get_json()
+        print(f"--- DEBUG: Raw Request Body Received:\n{data}")
+        if not data:
+            print("--- DEBUG: ERROR - Request body JSON is empty.")
+            return jsonify({"message": "ERROR", "error": "Request body JSON tidak ditemukan."}), 400
+
+        # 3. Validasi Input Dasar
+        metode_pembayaran_str = data.get('metode_pembayaran', 'Non-Tunai')
+        status_pembayaran_str = data.get('status_pembayaran', 'Belum Lunas')
+        status_order_str = data.get('status_order', 'Baru')
+        bookings_detail = data.get('bookings')
+        print(f"--- DEBUG: Parsed - Metode: {metode_pembayaran_str}, Status Bayar: {status_pembayaran_str}, Status Order: {status_order_str}")
+        print(f"--- DEBUG: Parsed - Bookings Detail Count: {len(bookings_detail) if isinstance(bookings_detail, list) else 'Invalid'}")
+
+        if not bookings_detail or not isinstance(bookings_detail, list) or len(bookings_detail) == 0:
+            print("--- DEBUG: ERROR - Bookings detail array is invalid or empty.")
+            return jsonify({"message": "ERROR", "error": "Detail booking (array 'bookings') tidak lengkap atau format salah."}), 400
+
+        # Validasi Enum Values (Penting!)
+        valid_metode = ['Tunai', 'Non-Tunai']
+        valid_status_bayar = ['Lunas', 'Belum Lunas', 'Dibatalkan', 'Disimpan'] # Tambah Disimpan jika perlu
+        valid_status_order = ['Baru', 'Diproses', 'Sebagian_diproses', 'Selesai', 'Batal']
+        if metode_pembayaran_str not in valid_metode:
+            print(f"--- DEBUG: ERROR - Invalid metode_pembayaran: {metode_pembayaran_str}")
+            return jsonify({"message": "ERROR", "error": f"Nilai metode pembayaran tidak valid: {metode_pembayaran_str}"}), 400 # 400 untuk input salah
+        if status_pembayaran_str not in valid_status_bayar:
+             print(f"--- DEBUG: ERROR - Invalid status_pembayaran: {status_pembayaran_str}")
+             return jsonify({"message": "ERROR", "error": f"Nilai status pembayaran tidak valid: {status_pembayaran_str}"}), 400
+        if status_order_str not in valid_status_order:
+             print(f"--- DEBUG: ERROR - Invalid status_order: {status_order_str}")
+             return jsonify({"message": "ERROR", "error": f"Nilai status order tidak valid: {status_order_str}"}), 400
+
+        # --- Inisialisasi Koneksi Database ---
+        connection = get_connection()
+        if not connection:
+            print("--- DEBUG: ERROR - Failed to get database connection.")
+            return jsonify({"message": "ERROR", "error": "Tidak dapat terhubung ke database."}), 500
+        # Gunakan cursor dictionary hanya jika diperlukan (misal di check_availability)
+        cursor_dict = connection.cursor(dictionary=True)
+
+        # 4. Buat Transaksi Utama (Gunakan cursor terpisah tanpa dictionary)
+        total_harga_final = 0 # TODO: Hitung harga jika perlu (ini penting!)
+        now_utc = datetime.now(timezone.utc) # Gunakan UTC untuk konsistensi
+
+        query_insert_transaksi = """
+            INSERT INTO transaksi
+            (id_user, nama_guest, total_harga_final, metode_pembayaran, status_pembayaran, status_order, tanggal_transaksi)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """
+        cursor_normal_trans = connection.cursor() # Cursor normal untuk INSERT
+        id_transaksi_baru = None
+        try:
+            print(f"--- DEBUG: Executing INSERT INTO transaksi with User ID: {id_user_login}, Time: {now_utc}")
+            cursor_normal_trans.execute(query_insert_transaksi, (
+                id_user_login,
+                None, # nama_guest NULL
+                total_harga_final, metode_pembayaran_str, status_pembayaran_str,
+                status_order_str, now_utc
+            ))
+            id_transaksi_baru = cursor_normal_trans.lastrowid
+            if not id_transaksi_baru:
+                print("--- DEBUG: ERROR - Failed to get lastrowid after inserting transaction.")
+                raise Exception("Gagal membuat record transaksi (lastrowid is null).")
+            print(f"--- DEBUG: Main Transaction Record Created with ID: {id_transaksi_baru}")
+        except Exception as trans_err:
+             print(f"--- DEBUG: ERROR inserting transaction: {trans_err}")
+             raise # Lemparkan lagi agar ditangkap di blok except utama
+        finally:
+            if cursor_normal_trans: cursor_normal_trans.close() # Tutup cursor ini segera
+
+        # 5. Validasi Ketersediaan & Siapkan Insert Booking Ruangan
+        query_insert_booking = """
+            INSERT INTO booking_ruangan
+            (id_transaksi, id_ruangan, waktu_mulai, waktu_selesai, durasi, kredit_terpakai)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        bookings_to_insert = []
+        booked_room_details = [] # Daftar konflik untuk pesan error
+
+        for i, booking_item in enumerate(bookings_detail):
+            print(f"\n--- DEBUG: Processing booking item #{i+1}: {booking_item}")
+
+            id_ruangan = booking_item.get('id_ruangan')
+            waktu_mulai_iso = booking_item.get('waktu_mulai')
+            waktu_selesai_iso = booking_item.get('waktu_selesai')
+            print(f"--- DEBUG #{i+1}: Ruangan ID: {id_ruangan}, Mulai ISO: {waktu_mulai_iso}, Selesai ISO: {waktu_selesai_iso}")
+
+            # Validasi Kelengkapan Data Item Booking
+            if not all([id_ruangan, waktu_mulai_iso, waktu_selesai_iso]):
+                print(f"--- DEBUG #{i+1}: ERROR - Incomplete booking item data.")
+                # Kembalikan 422 karena data tidak bisa diproses
+                connection.rollback(); return jsonify({"message": "ERROR", "error": f"Data booking item #{i+1} tidak lengkap."}), 422
+
+            # Konversi & Validasi Waktu (Penyebab umum 422)
+            try:
+                # Pastikan string ISO valid sebelum parsing
+                if not isinstance(waktu_mulai_iso, str) or not isinstance(waktu_selesai_iso, str):
+                    raise ValueError("Format waktu harus string ISO.")
+
+                # Handle timezone 'Z' (UTC) dengan benar
+                waktu_mulai_dt_utc = datetime.fromisoformat(waktu_mulai_iso.replace('Z', '+00:00')).astimezone(timezone.utc)
+                waktu_selesai_dt_utc = datetime.fromisoformat(waktu_selesai_iso.replace('Z', '+00:00')).astimezone(timezone.utc)
+                print(f"--- DEBUG #{i+1}: Parsed Mulai UTC: {waktu_mulai_dt_utc}, Parsed Selesai UTC: {waktu_selesai_dt_utc}")
+
+                if waktu_selesai_dt_utc <= waktu_mulai_dt_utc:
+                    print(f"--- DEBUG #{i+1}: ERROR - End time ({waktu_selesai_dt_utc}) is not after start time ({waktu_mulai_dt_utc}).")
+                    raise ValueError("Waktu selesai harus setelah waktu mulai.")
+
+                # Validasi tambahan: Waktu mulai tidak boleh di masa lalu
+                # if waktu_mulai_dt_utc < datetime.now(timezone.utc) - timedelta(minutes=5): # Toleransi 5 menit
+                #     print(f"--- DEBUG #{i+1}: ERROR - Start time is in the past.")
+                #     raise ValueError("Waktu mulai tidak boleh di masa lalu.")
+
+            except ValueError as e:
+                print(f"--- DEBUG #{i+1}: ERROR - Invalid time format or logic: {e}")
+                # Kembalikan 422 karena data waktu tidak bisa diproses
+                connection.rollback(); return jsonify({"message": "ERROR", "error": f"Format atau logika waktu tidak valid untuk item #{i+1}: {e}"}), 422
+            except Exception as time_err: # Tangkap error parsing lain
+                print(f"--- DEBUG #{i+1}: ERROR - Unexpected error parsing time: {time_err}")
+                connection.rollback(); return jsonify({"message": "ERROR", "error": f"Gagal memproses waktu untuk item #{i+1}."}), 422
+
+            # Validasi Ketersediaan (Penyebab 409)
+            try:
+                if not check_room_availability(cursor_dict, id_ruangan, waktu_mulai_dt_utc, waktu_selesai_dt_utc):
+                    cursor_dict.execute("SELECT nama_ruangan FROM ruangan WHERE id_ruangan = %s", (id_ruangan,))
+                    room_info = cursor_dict.fetchone()
+                    room_name = room_info['nama_ruangan'] if room_info else f"ID {id_ruangan}"
+                    # Format waktu lokal (misal WITA = UTC+8) untuk pesan error yang lebih ramah
+                    wita = timezone(timedelta(hours=8))
+                    start_local = waktu_mulai_dt_utc.astimezone(wita).strftime('%d/%m %H:%M')
+                    end_local = waktu_selesai_dt_utc.astimezone(wita).strftime('%H:%M')
+                    booked_room_details.append(f"'{room_name}' ({start_local} - {end_local})")
+                    print(f"--- DEBUG #{i+1}: CONFLICT - Room ID {id_ruangan} is not available at specified time.")
+            except DbError as db_avail_err: # Tangkap error DB dari check_availability
+                 print(f"--- DEBUG #{i+1}: DB ERROR during availability check: {db_avail_err}")
+                 connection.rollback(); return jsonify({"message": "ERROR", "error": "Gagal memeriksa ketersediaan ruangan."}), 500
+
+            # Hitung Durasi (dalam menit)
+            durasi_menit = max(0, int((waktu_selesai_dt_utc - waktu_mulai_dt_utc).total_seconds() / 60))
+            print(f"--- DEBUG #{i+1}: Calculated Duration: {durasi_menit} minutes.")
+
+            # Siapkan tuple untuk executemany (gunakan waktu UTC)
+            bookings_to_insert.append((
+                id_transaksi_baru, id_ruangan,
+                waktu_mulai_dt_utc, waktu_selesai_dt_utc, # Simpan sebagai UTC di DB
+                durasi_menit, 0 # kredit_terpakai default 0
+            ))
+
+        # Jika ada konflik ketersediaan, batalkan seluruh transaksi
+        if booked_room_details:
+            connection.rollback()
+            error_message = "Ruangan berikut tidak tersedia pada waktu yang dipilih: " + ", ".join(booked_room_details) + ". Silakan ubah pilihan waktu atau ruangan Anda."
+            print(f"--- DEBUG: ERROR - Availability conflicts found, rolling back. Details: {booked_room_details}")
+            return jsonify({"message": "ERROR", "error": error_message}), 409 # 409 Conflict
+
+        # 6. Jalankan Insert Booking (Gunakan cursor terpisah tanpa dictionary)
+        if bookings_to_insert:
+            cursor_normal_book = connection.cursor() # Cursor normal untuk INSERT
+            try:
+                print(f"--- DEBUG: Executing bulk INSERT INTO booking_ruangan for {len(bookings_to_insert)} items.")
+                cursor_normal_book.executemany(query_insert_booking, bookings_to_insert)
+                print(f"--- DEBUG: Successfully executed bulk insert for booking items.")
+            except Exception as insert_err:
+                connection.rollback()
+                print(f"--- DEBUG: ERROR executing bulk insert booking_ruangan: {insert_err}")
+                return jsonify({"message": "ERROR", "error": "Gagal menyimpan detail booking ke database."}), 500
+            finally:
+                if cursor_normal_book: cursor_normal_book.close() # Tutup cursor ini
+        else:
+            # Ini seharusnya tidak terjadi jika validasi awal `bookings_detail` benar
+            connection.rollback()
+            print("--- DEBUG: ERROR - No valid booking items to insert after processing loop.")
+            return jsonify({"message": "ERROR", "error": "Tidak ada detail booking yang valid untuk disimpan."}), 400
+
+        # 7. Commit Transaksi jika semua berhasil
+        connection.commit()
+        print(f"--- DEBUG: <<< SUCCESS >>> Bulk booking successful for user {id_user_login}, transaction {id_transaksi_baru}")
+        return jsonify({"message": "Pesanan ruangan berhasil dibuat!", "id_transaksi": id_transaksi_baru}), 201
+
+    except ValueError as ve: # Tangkap ValueError lebih spesifik (bisa dari parsing waktu atau int())
+        if connection: connection.rollback()
+        print(f"--- DEBUG: ValueError (likely data processing error): {ve}")
+        # Kembalikan 422 karena data tidak bisa diproses
+        return jsonify({"message": "ERROR", "error": f"Data tidak dapat diproses: {ve}"}), 422
+    except Exception as e: # Tangkap semua error lain sebagai 500
+        if connection: connection.rollback()
+        # Cetak traceback lengkap untuk debugging error tak terduga
+        print(f"--- DEBUG: !!! UNHANDLED EXCEPTION in /createBulk !!!")
+        print(f"--- Exception Type: {type(e).__name__}")
+        print(f"--- Exception Args: {e.args}")
+        traceback.print_exc(file=sys.stdout) # Cetak ke log server
+        return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal pada server."}), 500
+    finally:
+        # Selalu pastikan cursor dan koneksi ditutup
+        if cursor_dict: cursor_dict.close()
+        # cursor_normal_trans dan cursor_normal_book sudah ditutup di dalam try/finally masing-masing
+        if connection: connection.close()
+        print("--- DEBUG: Finished processing /createBulk request ---") # Tanda akhir request
+
 
 @ruangan_endpoints.route('/getVOClientByUserId', methods=['GET'])
 def get_vo_client_by_user_id():
@@ -129,7 +623,6 @@ def get_vo_client_by_user_id():
 
 
 
-
 @ruangan_endpoints.route('/workspaces', methods=['GET'])
 def get_workspaces_summary():
     """
@@ -142,7 +635,7 @@ def get_workspaces_summary():
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # Langkah 1: Query diubah untuk mengambil JUMLAH ruangan (room_count)
+        # PERBAIKAN: Mengubah klausa WHERE untuk mencakup semua jenis Room Meeting
         query = """
             SELECT 
                 kr.id_kategori_ruangan,
@@ -150,27 +643,27 @@ def get_workspaces_summary():
                 kr.deskripsi AS `desc`,
                 kr.gambar_kategori_ruangan AS img_filename,
                 (SELECT SUM(r.kapasitas) FROM ruangan r WHERE r.id_kategori_ruangan = kr.id_kategori_ruangan) AS total_capacity,
-                -- TAMBAHKAN SUBQUERY INI untuk menghitung jumlah ruangan
                 (SELECT COUNT(r.id_ruangan) FROM ruangan r WHERE r.id_kategori_ruangan = kr.id_kategori_ruangan) AS room_count,
                 (SELECT MIN(phr.harga_paket) FROM paket_harga_ruangan phr JOIN ruangan r ON phr.id_ruangan = r.id_ruangan WHERE r.id_kategori_ruangan = kr.id_kategori_ruangan AND phr.harga_paket > 0) AS min_price,
                 (SELECT r.fitur_ruangan FROM ruangan r WHERE r.id_kategori_ruangan = kr.id_kategori_ruangan LIMIT 1) AS fasilitas_sample
             FROM 
                 kategori_ruangan kr
             WHERE
-                kr.nama_kategori IN ('Space Monitor', 'Open Space', 'Room Meeting'); 
+                -- Menggunakan LIKE untuk mengambil 'Room Meeting Besar' dan 'Room Meeting Kecil'
+                kr.nama_kategori IN ('Space Monitor', 'Open Space') OR kr.nama_kategori LIKE 'Room Meeting%%';
         """
         cursor.execute(query)
         workspaces = cursor.fetchall()
         
         formatted_workspaces = []
-        # Langkah 2: Logika di Python diubah untuk format baru
         for ws in workspaces:
             fasilitas_list = ws['fasilitas_sample'].strip().split('\n') if ws['fasilitas_sample'] else []
             price_str = f"Rp{int(ws['min_price']):,}".replace(',', '.') if ws['min_price'] else "N/A"
 
             capacity_display = ""
-            if ws['title'] == 'Room Meeting':
-                # Format sebagai jumlah ruangan jika "Room Meeting"
+            # PERBAIKAN: Cek jika judul mengandung "Room Meeting"
+            if 'Room Meeting' in ws['title']:
+                # Format sebagai jumlah ruangan
                 capacity_display = f"{ws['room_count']}"
             else:
                 # Format sebagai total kapasitas untuk kategori lain
@@ -181,7 +674,7 @@ def get_workspaces_summary():
                 "title": ws['title'],
                 "desc": ws['desc'],
                 "img": ws['img_filename'],
-                "capacity": capacity_display,  # Menggunakan hasil format baru
+                "capacity": capacity_display,
                 "time": "08:00 - 22:00",
                 "date": datetime.now().strftime("%d %b %Y"),
                 "price": price_str,
@@ -211,9 +704,10 @@ def get_workspaces_summary():
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
-        if connection: connection.close()
-   
-        
+        if connection: connection.close()   
+
+
+
 @ruangan_endpoints.route('/ruangan/<int:id_ruangan>/booked_hours/<string:tanggal>', methods=['GET'])
 def get_booked_hours(id_ruangan, tanggal):
     """
@@ -260,35 +754,85 @@ def get_booked_hours(id_ruangan, tanggal):
         if connection:
             connection.close()
             
+            
+            
+# Di atas file, pastikan Anda mengimpor json
+import json
+from datetime import datetime, timedelta
+from flask import jsonify
 
-@ruangan_endpoints.route('/readPromo', methods=['GET'])
+# ... (kode lainnya)
+
+@ruangan_endpoints.route('/readPromos', methods=['GET'])
 def readPromo():
     """Routes for module get list promo"""
     try:
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
-        select_query = "SELECT * FROM promo WHERE status_aktif = 'aktif'"
+
+        # DIUBAH: Mengganti SELECT * dengan nama kolom eksplisit untuk memaksa pembacaan kolom 'syarat'
+        select_query = """
+            SELECT 
+                id_promo, kode_promo, deskripsi_promo, nilai_diskon, 
+                tanggal_mulai, tanggal_selesai, waktu_mulai, waktu_selesai, 
+                status_aktif, syarat 
+            FROM promo
+            WHERE status_aktif = 'aktif'
+              AND CURDATE() BETWEEN tanggal_mulai AND tanggal_selesai
+        """
         cursor.execute(select_query)
         results = cursor.fetchall()
 
-        # Convert timedelta or datetime to string
+        # Proses setiap baris hasil
         for row in results:
+            if row.get('syarat') and isinstance(row['syarat'], str):
+                try:
+                    row['syarat'] = json.loads(row['syarat'])
+                except json.JSONDecodeError:
+                    row['syarat'] = None
+
             for key, value in row.items():
-                if isinstance(value, (timedelta, datetime)):
+                if isinstance(value, (datetime, timedelta)):
                     row[key] = str(value)
 
         return jsonify({"message": "OK", "datas": results}), 200
     except Exception as e:
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor:
+        if 'cursor' in locals() and cursor:
             cursor.close()
-        if connection:
+        if 'connection' in locals() and connection:
             connection.close()
+
+# @ruangan_endpoints.route('/readPromo', methods=['GET'])
+# def readPromo():
+#     """Routes for module get list promo"""
+#     try:
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
+#         select_query = "SELECT * FROM promo WHERE status_aktif = 'aktif'"
+#         cursor.execute(select_query)
+#         results = cursor.fetchall()
+
+#         # Convert timedelta or datetime to string
+#         for row in results:
+#             for key, value in row.items():
+#                 if isinstance(value, (timedelta, datetime)):
+#                     row[key] = str(value)
+
+#         return jsonify({"message": "OK", "datas": results}), 200
+#     except Exception as e:
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor:
+#             cursor.close()
+#         if connection:
+#             connection.close()
 
 from flask import jsonify, request
 # Pastikan Anda mengimpor fungsi untuk koneksi database Anda, contoh:
 # from your_app.db import get_connection
+
 
 @ruangan_endpoints.route('/readMembershipByUserId', methods=['GET'])
 def readMembershipByUserId():
@@ -384,6 +928,7 @@ def readRuangan():
             SELECT r.*, k.nama_kategori
             FROM ruangan r
             JOIN kategori_ruangan k ON r.id_kategori_ruangan = k.id_kategori_ruangan
+            WHERE k.status = 'Active'
         """
         cursor.execute(query_ruangan)
         ruangan_list = cursor.fetchall()
@@ -563,7 +1108,7 @@ def get_all_event_spaces():
                 gambar_ruangan,
                 fitur_ruangan
             FROM event_spaces
-            WHERE status_ketersediaan = 'Tersedia'
+            WHERE status_ketersediaan = 'Active'
         """
         cursor.execute(query)
         event_spaces = cursor.fetchall()

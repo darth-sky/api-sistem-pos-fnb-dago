@@ -14,61 +14,91 @@ from datetime import datetime # --- PERUBAHAN 1: Impor library datetime ---
 tenant_endpoints = Blueprint('tenant', __name__)
 UPLOAD_FOLDER = "img"
 
-@tenant_endpoints.route('/orders/<int:order_id>/status', methods=['PUT'])
-def update_order_status(order_id):
-    """
-    Endpoint untuk mengupdate status_order pada sebuah transaksi.
-    Menerima JSON body: { "status": "NAMA_STATUS_BARU" }
-    """
-    # Ambil data JSON dari body request
-    data = request.get_json()
-    if not data or 'status' not in data:
-        return jsonify({"message": "ERROR", "error": "Missing 'status' in request body"}), 400
 
-    new_status = data['status']
+@tenant_endpoints.route('/orders/transaksi/<int:id_transaksi>/status', methods=['PUT'])
+def update_transaction_status_by_tenant(id_transaksi):
+    """
+    Endpoint untuk mengupdate status SEMUA item milik tenant 
+    dalam satu transaksi.
+    Menerima JSON body: { "status": "NAMA_STATUS_UI", "tenant_id": ID_TENANT_ANDA }
+    """
+    data = request.get_json()
+    print("📥 Data diterima:", data)
+    if not data or 'status' not in data or 'tenant_id' not in data:
+        return jsonify({"message": "ERROR", "error": "Missing 'status' or 'tenant_id' in request body"}), 400
+
+    new_status_ui = data['status']
+    id_tenant = data['tenant_id']
     
-    # Validasi sederhana untuk status yang diizinkan
-    allowed_statuses = ['Baru', 'Diproses', 'Selesai', 'Batal'] # Sesuaikan dengan ENUM di database Anda
-    # Di frontend Anda menggunakan 'ON PROSES' dan 'FINISH', kita sesuaikan di sini
-    # Frontend -> Backend mapping
+    # Mapping dari status UI ke status Database
     status_map = {
         "ON PROSES": "Diproses",
         "FINISH": "Selesai",
         "NEW": "Baru"
     }
     
-    db_status = status_map.get(new_status, new_status) # Gunakan mapping jika ada
-
-    if db_status not in allowed_statuses:
-        return jsonify({"message": "ERROR", "error": f"Invalid status value: {new_status}"}), 400
+    db_status = status_map.get(new_status_ui)
+    
+    if not db_status:
+         return jsonify({"message": "ERROR", "error": f"Invalid status value: {new_status_ui}"}), 400
 
     connection = None
     try:
         connection = get_connection()
         cursor = connection.cursor()
 
-        query = "UPDATE transaksi SET status_order = %s WHERE id_transaksi = %s"
-        
-        cursor.execute(query, (db_status, order_id))
+        # Tentukan status asal (status_lama) berdasarkan status baru (db_status)
+        status_asal = None
+        if db_status == "Diproses":
+            status_asal = "Baru"
+        elif db_status == "Selesai":
+            status_asal = "Diproses"
 
-        # Cek apakah ada baris yang ter-update. Jika tidak, order_id tidak ditemukan.
-        if cursor.rowcount == 0:
-            return jsonify({"message": "ERROR", "error": "Order not found"}), 404
+        if status_asal is None:
+             return jsonify({"message": "ERROR", "error": f"Invalid state transition to {db_status}"}), 400
+
+        # === 1. 👈 PERBAIKAN UTAMA: Query diubah ===
+        # Query ini mengganti "UPDATE...JOIN" dengan "UPDATE...WHERE...IN"
+        # Ini jauh lebih stabil untuk konektor mysql-python.
+        query_aman = """
+            UPDATE detail_order_fnb
+            SET 
+                status_pesanan = %s  -- 1. status_baru (misal: "Diproses")
+            WHERE 
+                id_transaksi = %s AND -- 2. id_transaksi (misal: 356)
+                status_pesanan = %s AND -- 3. status_lama (misal: "Baru")
+                id_produk IN (
+                    -- Subquery untuk menemukan semua produk milik tenant ini
+                    SELECT p.id_produk
+                    FROM produk_fnb p
+                    JOIN kategori_produk kp ON p.id_kategori = kp.id_kategori
+                    WHERE kp.id_tenant = %s -- 4. id_tenant (misal: 3)
+                );
+        """
         
-        # PENTING: Commit perubahan ke database
+        # === 2. 👈 PERBAIKAN: Urutan parameter disesuaikan dengan query baru ===
+        params = (db_status, id_transaksi, status_asal, id_tenant)
+
+        cursor.execute(query_aman, params)
         connection.commit()
 
-        return jsonify({"message": f"Order {order_id} status updated successfully to {db_status}"}), 200
+        return jsonify({
+            "message": f"Order {id_transaksi} updated successfully for tenant {id_tenant}",
+            "rows_affected": cursor.rowcount
+        }), 200
 
     except Exception as e:
+        # 3. 👈 PERBAIKAN: Debugging dan rollback tetap dipertahankan
+        print(f"❌ DATABASE ERROR: {e}") 
         if connection:
-            connection.rollback() # Batalkan transaksi jika terjadi error
+            connection.rollback()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if connection and connection.is_connected():
             cursor.close()
             connection.close()
-
+            
+            
 
 @tenant_endpoints.route("/updateProdukStatus/<int:id_produk>", methods=["PUT"])
 def update_produk_status(id_produk):
@@ -132,13 +162,14 @@ def get_orders_by_tenant(id_tenant):
             SELECT 
                 t.id_transaksi,
                 COALESCE(u.nama, t.nama_guest, 'Guest') as customer_name,
-                t.status_order,
                 t.fnb_type,
                 t.lokasi_pemesanan,
                 t.total_harga_final,
                 t.tanggal_transaksi,
+                dof.id_detail_order,
                 dof.jumlah,
                 dof.catatan_pesanan,
+                dof.status_pesanan,
                 p.nama_produk
             FROM transaksi t
             JOIN detail_order_fnb dof ON t.id_transaksi = dof.id_transaksi
@@ -147,7 +178,8 @@ def get_orders_by_tenant(id_tenant):
             LEFT JOIN users u ON t.id_user = u.id_user
             WHERE 
                 kp.id_tenant = %s AND
-                t.status_order IN ('Baru', 'Diproses') -- <-- FIX 1: Memfilter hanya pesanan aktif
+                t.status_pembayaran = 'Lunas' AND
+                dof.status_pesanan IN ('Baru', 'Diproses', 'Selesai', 'Batal') -- <-- FIX 1: Memfilter hanya pesanan aktif
             ORDER BY t.tanggal_transaksi DESC;
         """
         cursor.execute(query, (id_tenant,))
@@ -159,15 +191,16 @@ def get_orders_by_tenant(id_tenant):
             order_id = row['id_transaksi']
             if order_id not in orders_dict:
                 # FIX 3: Mapping status DB ('Baru') ke status UI ('NEW')
-                status_ui = "NEW"
-                if row['status_order'] == 'Diproses':
-                    status_ui = "ON PROSES"
+                # status_ui = "NEW"
+                # if row['status_pesanan'] == 'Diproses':
+                #     status_ui = "ON PROSES"
 
                 orders_dict[order_id] = {
                     "id": order_id,
+                    "id_detail_order": row['id_detail_order'],
                     "code": f"ORD-{str(order_id).zfill(4)}",
                     "name": row['customer_name'],
-                    "status": status_ui,
+                    "status": row['status_pesanan'],
                     "type": row['fnb_type'],
                     "place": row['lokasi_pemesanan'],
                     "total": int(row['total_harga_final']),

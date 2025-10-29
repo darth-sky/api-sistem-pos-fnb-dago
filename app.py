@@ -27,10 +27,12 @@ from api.eventSpaces.endpoints import eventspaces_endpoints
 from api.tenantadmin.endpoints import tenantadmin_endpoints
 from api.useradmin.endpoints import useradmin_endpoints
 from api.owner.endpoints import owner_endpoints
+from api.admin.endpoints import admin_endpoints
+from api.acara.endpoints import acara_endpoints
 
 from config import Config
 from static.static_file_server import static_file_server
-
+from doc_endpoint.doc_file_server import doc_file_server
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -68,7 +70,9 @@ app.register_blueprint(eventspaces_endpoints, url_prefix='/api/v1/eventspaces/')
 app.register_blueprint(tenantadmin_endpoints, url_prefix='/api/v1/tenantadmin/')
 app.register_blueprint(useradmin_endpoints, url_prefix='/api/v1/useradmin/')
 app.register_blueprint(owner_endpoints, url_prefix='/api/v1/owner/')
-
+app.register_blueprint(admin_endpoints, url_prefix='/api/v1/admin/')
+app.register_blueprint(doc_file_server)
+app.register_blueprint(acara_endpoints, url_prefix='/api/v1/acara')
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', debug=True, port=5000)

@@ -166,16 +166,17 @@ def delete_ruangan(id_ruangan):
         if 'conn' in locals() and conn: conn.close()
 
 
-
-
 @ruanganadmin_endpoints.route('/readKategori', methods=['GET'])
 def read_kategori_ruangan():
+    # Endpoint ini tidak perlu diubah, SELECT * sudah mengambil kolom status.
+    # Namun, untuk kejelasan, kita bisa menentukannya secara eksplisit.
     connection = None
     cursor = None
     try:
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
-        query = "SELECT id_kategori_ruangan, nama_kategori, deskripsi FROM kategori_ruangan ORDER BY id_kategori_ruangan DESC"
+        # Query lebih baik dibuat eksplisit
+        query = "SELECT id_kategori_ruangan, nama_kategori, deskripsi, gambar_kategori_ruangan, status FROM kategori_ruangan ORDER BY id_kategori_ruangan DESC"
         cursor.execute(query)
         results = cursor.fetchall()
         return jsonify({"message": "OK", "datas": results}), 200
@@ -185,66 +186,179 @@ def read_kategori_ruangan():
         if cursor: cursor.close()
         if connection: connection.close()
 
-
-# ✅ CREATE kategori ruangan
+# ✅ CREATE kategori ruangan (Diperbarui untuk FormData)
 @ruanganadmin_endpoints.route('/createKategori', methods=['POST'])
 def create_kategori_ruangan():
     connection = None
     cursor = None
     try:
-        data = request.get_json()
-        nama_kategori = data.get("nama_kategori")
-        deskripsi = data.get("deskripsi")
+        # Mengambil data dari form-data, bukan JSON
+        nama_kategori = request.form.get("nama_kategori")
+        deskripsi = request.form.get("deskripsi")
+        status = request.form.get("status", 'Active')
 
         if not nama_kategori:
             return jsonify({"message": "ERROR", "error": "nama_kategori wajib diisi"}), 400
 
+        # Logika untuk menangani file upload
+        gambar_filename = None
+        if 'gambar_kategori_ruangan' in request.files:
+            file = request.files['gambar_kategori_ruangan']
+            if file and file.filename != '':
+                filename = secure_filename(file.filename)
+                # Opsi: buat nama file unik untuk menghindari tumpukan
+                # unique_filename = str(uuid.uuid4()) + "_" + filename
+                file.save(os.path.join(UPLOAD_FOLDER, filename))
+                gambar_filename = filename
+
         connection = get_connection()
         cursor = connection.cursor()
-        query = "INSERT INTO kategori_ruangan (nama_kategori, deskripsi) VALUES (%s, %s)"
-        cursor.execute(query, (nama_kategori, deskripsi))
+        query = "INSERT INTO kategori_ruangan (nama_kategori, deskripsi, status, gambar_kategori_ruangan) VALUES (%s, %s, %s, %s)"
+        cursor.execute(query, (nama_kategori, deskripsi, status, gambar_filename))
         connection.commit()
 
         return jsonify({"message": "Kategori ruangan berhasil ditambahkan"}), 201
     except Exception as e:
+        if connection: connection.rollback()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
 
 
-# ✅ UPDATE kategori ruangan
+# ✅ UPDATE kategori ruangan (Diperbarui untuk FormData)
 @ruanganadmin_endpoints.route('/updateKategori/<int:id_kategori>', methods=['PUT'])
 def update_kategori_ruangan(id_kategori):
     connection = None
     cursor = None
     try:
-        data = request.get_json()
-        nama_kategori = data.get("nama_kategori")
-        deskripsi = data.get("deskripsi")
+        nama_kategori = request.form.get("nama_kategori")
+        deskripsi = request.form.get("deskripsi")
+        status = request.form.get("status")
 
-        if not nama_kategori:
-            return jsonify({"message": "ERROR", "error": "nama_kategori wajib diisi"}), 400
+        if not nama_kategori or not status:
+            return jsonify({"message": "ERROR", "error": "nama_kategori dan status wajib diisi"}), 400
 
         connection = get_connection()
-        cursor = connection.cursor()
+        cursor = connection.cursor(dictionary=True)
+        
+        # Dapatkan nama file lama sebelum update
+        cursor.execute("SELECT gambar_kategori_ruangan FROM kategori_ruangan WHERE id_kategori_ruangan = %s", (id_kategori,))
+        existing_data = cursor.fetchone()
+        if not existing_data:
+            return jsonify({"message": "ERROR", "error": "Kategori tidak ditemukan"}), 404
+
+        gambar_filename = existing_data['gambar_kategori_ruangan']
+
+        # Cek jika ada file baru yang diupload
+        if 'gambar_kategori_ruangan' in request.files:
+            file = request.files['gambar_kategori_ruangan']
+            if file and file.filename != '':
+                # Hapus file lama jika ada
+                if gambar_filename and os.path.exists(os.path.join(UPLOAD_FOLDER, gambar_filename)):
+                    os.remove(os.path.join(UPLOAD_FOLDER, gambar_filename))
+                
+                filename = secure_filename(file.filename)
+                file.save(os.path.join(UPLOAD_FOLDER, filename))
+                gambar_filename = filename
+        
+        # Lakukan update ke database
+        update_cursor = connection.cursor()
         query = """
             UPDATE kategori_ruangan 
-            SET nama_kategori = %s, deskripsi = %s 
+            SET nama_kategori = %s, deskripsi = %s, status = %s, gambar_kategori_ruangan = %s
             WHERE id_kategori_ruangan = %s
         """
-        cursor.execute(query, (nama_kategori, deskripsi, id_kategori))
+        update_cursor.execute(query, (nama_kategori, deskripsi, status, gambar_filename, id_kategori))
         connection.commit()
-
-        if cursor.rowcount == 0:
-            return jsonify({"message": "ERROR", "error": "Kategori ruangan tidak ditemukan"}), 404
+        update_cursor.close()
 
         return jsonify({"message": "Kategori ruangan berhasil diperbarui"}), 200
     except Exception as e:
+        if connection: connection.rollback()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
+
+
+# @ruanganadmin_endpoints.route('/readKategori', methods=['GET'])
+# def read_kategori_ruangan():
+#     connection = None
+#     cursor = None
+#     try:
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
+#         query = "SELECT id_kategori_ruangan, nama_kategori, deskripsi FROM kategori_ruangan ORDER BY id_kategori_ruangan DESC"
+#         cursor.execute(query)
+#         results = cursor.fetchall()
+#         return jsonify({"message": "OK", "datas": results}), 200
+#     except Exception as e:
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor: cursor.close()
+#         if connection: connection.close()
+
+
+# # ✅ CREATE kategori ruangan
+# @ruanganadmin_endpoints.route('/createKategori', methods=['POST'])
+# def create_kategori_ruangan():
+#     connection = None
+#     cursor = None
+#     try:
+#         data = request.get_json()
+#         nama_kategori = data.get("nama_kategori")
+#         deskripsi = data.get("deskripsi")
+
+#         if not nama_kategori:
+#             return jsonify({"message": "ERROR", "error": "nama_kategori wajib diisi"}), 400
+
+#         connection = get_connection()
+#         cursor = connection.cursor()
+#         query = "INSERT INTO kategori_ruangan (nama_kategori, deskripsi) VALUES (%s, %s)"
+#         cursor.execute(query, (nama_kategori, deskripsi))
+#         connection.commit()
+
+#         return jsonify({"message": "Kategori ruangan berhasil ditambahkan"}), 201
+#     except Exception as e:
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor: cursor.close()
+#         if connection: connection.close()
+
+
+# # ✅ UPDATE kategori ruangan
+# @ruanganadmin_endpoints.route('/updateKategori/<int:id_kategori>', methods=['PUT'])
+# def update_kategori_ruangan(id_kategori):
+#     connection = None
+#     cursor = None
+#     try:
+#         data = request.get_json()
+#         nama_kategori = data.get("nama_kategori")
+#         deskripsi = data.get("deskripsi")
+
+#         if not nama_kategori:
+#             return jsonify({"message": "ERROR", "error": "nama_kategori wajib diisi"}), 400
+
+#         connection = get_connection()
+#         cursor = connection.cursor()
+#         query = """
+#             UPDATE kategori_ruangan 
+#             SET nama_kategori = %s, deskripsi = %s 
+#             WHERE id_kategori_ruangan = %s
+#         """
+#         cursor.execute(query, (nama_kategori, deskripsi, id_kategori))
+#         connection.commit()
+
+#         if cursor.rowcount == 0:
+#             return jsonify({"message": "ERROR", "error": "Kategori ruangan tidak ditemukan"}), 404
+
+#         return jsonify({"message": "Kategori ruangan berhasil diperbarui"}), 200
+#     except Exception as e:
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor: cursor.close()
+#         if connection: connection.close()
 
 
 # ✅ DELETE kategori ruangan
