@@ -32,31 +32,69 @@ def read_kategori():
     return jsonify({"message": "OK", "datas": results}), 200
 
 
-
 @produk_endpoints.route('/readByKategori', methods=['GET'])
 def readByKategori():
-    connection = get_connection()
+    connection = None
+    cursor = None
     try:
+        connection = get_connection()
         cursor = connection.cursor(dictionary=True)
         id_kategori = request.args.get('id_kategori')
 
+        # Query default, akan dimodifikasi jika ada id_kategori
+        # Ambil SEMUA kolom yang relevan, terutama status_ketersediaan
+        query = """
+            SELECT
+                p.id_produk, p.nama_produk, p.deskripsi_produk, p.harga,
+                p.status_ketersediaan, p.foto_produk, p.id_kategori
+            FROM produk_fnb p
+            WHERE p.status_visibilitas = 'Aktif'
+            ORDER BY p.nama_produk ASC
+        """
+        params = () # Tuple parameter kosong default
+
         if id_kategori:
             # --- PERBAIKAN DI SINI ---
-            # Tambahkan kondisi AND untuk hanya mengambil produk yang 'Active'
-            query = "SELECT * FROM produk_fnb WHERE id_kategori = %s AND status_ketersediaan = 'Active'"
-            cursor.execute(query, (id_kategori,))
-        else:
-            # Anda juga bisa menambahkan filter di sini jika diperlukan
-            query = "SELECT * FROM produk_fnb WHERE status_ketersediaan = 'Active'"
-            cursor.execute(query)
+            # Tambahkan filter id_kategori DAN pastikan filter visibilitas tetap ada
+            query = """
+                SELECT
+                    p.id_produk, p.nama_produk, p.deskripsi_produk, p.harga,
+                    p.status_ketersediaan, p.foto_produk, p.id_kategori
+                FROM produk_fnb p
+                WHERE p.id_kategori = %s
+                  AND p.status_visibilitas = 'Aktif'
+                ORDER BY p.nama_produk ASC
+            """
+            params = (id_kategori,) # Parameter untuk query
+        # else:
+            # Jika tidak ada id_kategori, mungkin lebih baik tidak mengembalikan apa-apa
+            # atau kembalikan semua produk aktif (sesuai kebutuhan UI)
+            # Jika ingin semua produk aktif:
+            # query = """
+            #     SELECT p.id_produk, p.nama_produk, p.deskripsi_produk, p.harga,
+            #            p.status_ketersediaan, p.foto_produk, p.id_kategori
+            #     FROM produk_fnb p
+            #     WHERE p.status_visibilitas = 'Aktif'
+            #     ORDER BY p.id_kategori, p.nama_produk ASC
+            # """
+            # params = ()
+            # Jika tidak ingin mengembalikan apa-apa jika tidak ada id_kategori:
+            # return jsonify({"message": "OK", "datas": []}), 200
 
+
+        cursor.execute(query, params)
         results = cursor.fetchall()
+
+    except Exception as e:
+        print(f"Error reading products by category: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        cursor.close()
-        connection.close()
+        if cursor: cursor.close()
+        if connection: connection.close()
 
     return jsonify({"message": "OK", "datas": results}), 200
-
 
 
 # @produk_endpoints.route('/create', methods=['POST'])
@@ -328,7 +366,7 @@ def create_transaksi_fnb_with_tax():
             lokasi_pemesanan if fnb_type == 'Dine In' else None,
             metode_pembayaran_db, subtotal_backend, pajak_persen_db,
             pajak_nominal_backend, total_harga_final_backend,
-            'Belum Lunas', 'Baru'
+            'Disimpan', 'Baru'
         )
         cursor.execute(query_transaksi, values_transaksi)
         id_transaksi_baru = cursor.lastrowid
@@ -421,9 +459,9 @@ def create_transaksi_fnb_with_tax():
             cursor.close()
         if connection:
             connection.close()
-         
+
             
-                        
+
 @produk_endpoints.route('/tenants', methods=['GET'])
 def get_all_tenants():
     """Mengambil daftar semua tenant yang aktif."""

@@ -18,7 +18,7 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER",
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD",
                            "xhxs podr zrxk tlay")  # app password
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL",
-                        "gungdiah159@gmail.com")  # email tujuan admin
+                        "gungdiahpram5@gmail.com")  # email tujuan admin
 
 
 def send_email_notification(subject,

@@ -5,7 +5,7 @@ from flask import Blueprint, jsonify, request
 import mysql
 from helper.db_helper import get_connection
 from helper.form_validation import get_form_data
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import get_jwt_identity, jwt_required
 from helper.year_operation import diff_year
 from helper.year_operation import check_age_book
 from flask import jsonify
@@ -15,6 +15,540 @@ from collections import defaultdict
 
 kasir_endpoints = Blueprint('kasir', __name__)
 UPLOAD_FOLDER = "img"
+
+
+def serialize_db_row(row):
+    if not row:
+        return None
+    serialized = {}
+    for key, value in row.items():
+        if isinstance(value, (datetime, date)):
+            serialized[key] = value.isoformat()
+        elif isinstance(value, decimal.Decimal):
+            serialized[key] = float(value)
+        else:
+            serialized[key] = value
+    return serialized
+# --- AKHIR HELPER ---
+
+
+# --- ENDPOINT BARU UNTUK HISTORY SESI ---
+@kasir_endpoints.route('/sesi/history', methods=['GET'])
+@jwt_required()
+def get_history_for_current_session():
+    # 1. Dapatkan ID kasir dari token
+    jwt_identity = get_jwt_identity()
+    try:
+        id_user_kasir = jwt_identity.get('id_user')
+        if not id_user_kasir:
+            return jsonify({"message": "ERROR", "error": "Format token tidak valid."}), 401
+    except AttributeError:
+        id_user_kasir = jwt_identity
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # 2. Cari sesi yang sedang aktif untuk kasir ini
+        cursor.execute("""
+            SELECT id_sesi 
+            FROM sesi_kasir 
+            WHERE id_user_kasir = %s AND status_sesi = 'Dibuka' 
+            LIMIT 1
+        """, (id_user_kasir,))
+        sesi_aktif = cursor.fetchone()
+
+        if not sesi_aktif:
+            # Jika tidak ada sesi aktif, kembalikan histori kosong
+            return jsonify({"message": "OK", "transactions": []}), 200
+
+        id_sesi_aktif = sesi_aktif['id_sesi']
+
+        # 3. Ambil semua transaksi HANYA UNTUK id_sesi_aktif tersebut
+        #    (Query ini juga mengambil detail F&B dan Ruangan)
+        query = """
+            SELECT
+                t.id_transaksi,
+                t.tanggal_transaksi,
+                COALESCE(u.nama, t.nama_guest) AS nama_pelanggan,
+                t.metode_pembayaran,
+                t.total_harga_final,
+                t.status_order,
+                (SELECT GROUP_CONCAT(pf.nama_produk SEPARATOR ', ')
+                    FROM detail_order_fnb dof
+                    JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+                    WHERE dof.id_transaksi = t.id_transaksi
+                ) AS fnb_items,
+                (SELECT GROUP_CONCAT(r.nama_ruangan SEPARATOR ', ')
+                    FROM booking_ruangan br
+                    JOIN ruangan r ON br.id_ruangan = r.id_ruangan
+                    WHERE br.id_transaksi = t.id_transaksi
+                ) AS room_items
+            FROM transaksi t
+            LEFT JOIN users u ON t.id_user = u.id_user
+            WHERE t.id_sesi = %s -- <-- FILTER UTAMA
+            ORDER BY t.tanggal_transaksi DESC;
+        """
+        cursor.execute(query, (id_sesi_aktif,))
+        transaksi_list_raw = cursor.fetchall()
+
+        # 4. Serialisasi data (handle Decimal/datetime)
+        safe_transaksi = [serialize_db_row(trx) for trx in transaksi_list_raw]
+
+        return jsonify({"message": "OK", "transactions": safe_transaksi}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+@kasir_endpoints.route('/sesi/buka', methods=['POST'])
+@jwt_required()
+def buka_sesi_kasir():
+    # --- PERBAIKAN 1: Ekstrak ID dari identity ---
+    jwt_identity = get_jwt_identity()
+    try:
+        # Asumsi key di dalam token Anda adalah 'id_user'
+        id_user_kasir = jwt_identity.get('id_user')
+        if not id_user_kasir:
+            return jsonify({"message": "ERROR", "error": "Format token tidak valid."}), 401
+    except AttributeError:
+        # Fallback jika identity BUKAN dictionary
+        id_user_kasir = jwt_identity
+    # --- AKHIR PERBAIKAN 1 ---
+
+    data = request.get_json()
+    nama_sesi = data.get('nama_sesi')
+    saldo_awal = data.get('saldo_awal')
+
+    if saldo_awal is None:  # Cek 'is None' lebih aman
+        return jsonify({"message": "ERROR", "error": "Saldo awal wajib diisi."}), 400
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # --- PERBAIKAN 2: Gunakan id_user_kasir (INT) di query ---
+        cursor.execute(
+            "SELECT id_sesi FROM sesi_kasir WHERE id_user_kasir = %s AND status_sesi = 'Dibuka'", (id_user_kasir,))
+        # --- AKHIR PERBAIKAN 2 ---
+
+        sesi_aktif = cursor.fetchone()
+        if sesi_aktif:
+            return jsonify({"message": "ERROR", "error": "Anda sudah memiliki sesi yang aktif."}), 400
+
+        # Buat sesi baru
+        query = """
+            INSERT INTO sesi_kasir (id_user_kasir, nama_sesi, saldo_awal, status_sesi, waktu_mulai)
+            VALUES (%s, %s, %s, 'Dibuka', NOW())
+        """
+
+        # --- PERBAIKAN 3: Gunakan id_user_kasir (INT) di query ---
+        cursor.execute(query, (id_user_kasir, nama_sesi,
+                       decimal.Decimal(saldo_awal)))
+        # --- AKHIR PERBAIKAN 3 ---
+
+        new_session_id = cursor.lastrowid
+        connection.commit()
+
+        return jsonify({"message": "OK", "info": "Sesi kasir berhasil dibuka", "id_sesi": new_session_id}), 201
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+# # --- 2. ENDPOINT UNTUK MENUTUP SESI ---
+# @kasir_endpoints.route('/sesi/tutup', methods=['POST'])
+# @jwt_required()
+# def tutup_sesi_kasir():
+#     # (Ekstrak ID Kasir - Kode ini sudah benar)
+#     jwt_identity = get_jwt_identity()
+#     try:
+#         id_user_kasir = jwt_identity.get('id_user')
+#         if not id_user_kasir:
+#             return jsonify({"message": "ERROR", "error": "Format token tidak valid."}), 401
+#     except AttributeError:
+#         id_user_kasir = jwt_identity
+
+#     data = request.get_json()
+#     saldo_akhir_aktual = data.get('saldo_akhir_aktual')
+
+#     if saldo_akhir_aktual is None:
+#         return jsonify({"message": "ERROR", "error": "Saldo akhir aktual wajib diisi."}), 400
+
+#     connection = None
+#     cursor = None
+#     try:
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
+
+#         # (Cari sesi aktif - Kode ini sudah benar)
+#         cursor.execute("SELECT id_sesi, saldo_awal FROM sesi_kasir WHERE id_user_kasir = %s AND status_sesi = 'Dibuka' LIMIT 1", (id_user_kasir,))
+#         sesi_aktif = cursor.fetchone()
+#         if not sesi_aktif:
+#             return jsonify({"message": "ERROR", "error": "Tidak ada sesi aktif untuk ditutup."}), 404
+
+#         id_sesi = sesi_aktif['id_sesi']
+#         saldo_awal_sesi = sesi_aktif['saldo_awal']
+
+#         # (Hitung total tunai - Kode ini sudah benar)
+#         cursor.execute("SELECT SUM(total_harga_final) as total_tunai FROM transaksi WHERE id_sesi = %s AND metode_pembayaran = 'Tunai'", (id_sesi,))
+#         result_tunai = cursor.fetchone()
+#         total_tunai = result_tunai['total_tunai'] or 0
+#         saldo_akhir_tercatat = saldo_awal_sesi + total_tunai
+
+#         # (Update sesi kasir - Kode ini sudah benar)
+#         query_update_sesi = """
+#             UPDATE sesi_kasir SET saldo_akhir_tercatat = %s, saldo_akhir_aktual = %s, status_sesi = 'Ditutup', waktu_selesai = NOW()
+#             WHERE id_sesi = %s
+#         """
+#         cursor.execute(query_update_sesi, (saldo_akhir_tercatat, decimal.Decimal(saldo_akhir_aktual), id_sesi))
+
+        # # === PERUBAHAN DI SINI: Update status semua produk F&B ===
+        # query_update_produk = "UPDATE produk_fnb SET status_ketersediaan = 'Inactive'"
+        # cursor.execute(query_update_produk)
+        # # === AKHIR PERUBAHAN ===
+
+        # # Commit SEMUA perubahan (update sesi DAN update produk)
+        # connection.commit()
+
+#         return jsonify({"message": "OK", "info": "Sesi kasir berhasil ditutup, status produk diperbarui"}), 200 # Pesan bisa disesuaikan
+
+#     except Exception as e:
+#         if connection: connection.rollback() # Rollback jika salah satu query gagal
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor: cursor.close()
+#         if connection: connection.close()
+
+
+@kasir_endpoints.route('/sesi/tutup', methods=['POST'])
+@jwt_required()
+def tutup_sesi_kasir():
+    # (Ekstrak ID Kasir - Kode ini sudah benar)
+    jwt_identity = get_jwt_identity()
+    try:
+        id_user_kasir = jwt_identity.get('id_user')
+        if not id_user_kasir:
+            return jsonify({"message": "ERROR", "error": "Format token tidak valid."}), 401
+    except AttributeError:
+        id_user_kasir = jwt_identity
+
+    data = request.get_json()
+    saldo_akhir_aktual = data.get(
+        'saldo_akhir_aktual')  # Uang yg dihitung manual
+
+    # --- PERUBAHAN 1: Ambil nama kasir penutup dari JSON ---
+    nama_kasir_penutup = data.get('nama_kasir_penutup')
+    # --- AKHIR PERUBAHAN 1 ---
+
+    if saldo_akhir_aktual is None:
+        return jsonify({"message": "ERROR", "error": "Saldo akhir aktual wajib diisi."}), 400
+
+    # --- Validasi nama (opsional tapi disarankan) ---
+    if not nama_kasir_penutup:
+        return jsonify({"message": "ERROR", "error": "Nama kasir penutup wajib diisi."}), 400
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # (Cari sesi aktif - Kode ini sudah benar)
+        cursor.execute(
+            "SELECT id_sesi, saldo_awal FROM sesi_kasir WHERE id_user_kasir = %s AND status_sesi = 'Dibuka' LIMIT 1", (id_user_kasir,))
+        sesi_aktif = cursor.fetchone()
+
+        if not sesi_aktif:
+            return jsonify({"message": "ERROR", "error": "Tidak ada sesi aktif untuk ditutup."}), 404
+
+        id_sesi = sesi_aktif['id_sesi']
+        saldo_awal_sesi = sesi_aktif['saldo_awal']
+
+        # (Hitung total tunai - Kode ini sudah benar)
+        cursor.execute("""
+            SELECT SUM(total_harga_final) as total_tunai
+            FROM transaksi
+            WHERE id_sesi = %s AND metode_pembayaran = 'Tunai'
+        """, (id_sesi,))
+        result_tunai = cursor.fetchone()
+        total_tunai = result_tunai['total_tunai'] or 0
+
+        saldo_akhir_tercatat = saldo_awal_sesi + total_tunai
+
+        # --- PERUBAHAN 2: Update query untuk menyertakan nama_kasir_penutup ---
+        query_update = """
+            UPDATE sesi_kasir
+            SET saldo_akhir_tercatat = %s,
+                saldo_akhir_aktual = %s,
+                nama_kasir_penutup = %s, -- <-- Kolom baru
+                status_sesi = 'Ditutup',
+                waktu_selesai = NOW()
+            WHERE id_sesi = %s
+        """
+        # Tambahkan 'nama_kasir_penutup' ke values
+        cursor.execute(query_update, (saldo_akhir_tercatat, decimal.Decimal(
+            saldo_akhir_aktual), nama_kasir_penutup, id_sesi))
+        # --- AKHIR PERUBAHAN 2 ---
+
+        connection.commit()
+
+        # === PERUBAHAN DI SINI: Update status semua produk F&B ===
+        query_update_produk = "UPDATE produk_fnb SET status_ketersediaan = 'Inactive'"
+        cursor.execute(query_update_produk)
+        # === AKHIR PERUBAHAN ===
+
+        # Commit SEMUA perubahan (update sesi DAN update produk)
+        connection.commit()
+
+        return jsonify({"message": "OK", "info": "Sesi kasir berhasil ditutup"}), 200
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+# --- PERBAIKI HELPER FUNCTION INI ---
+def serialize_session(session_dict):
+    if not session_dict:
+        return None
+
+    serialized = {}
+    for key, value in session_dict.items():
+        # --- PERUBAHAN DI SINI ---
+        # Kita tidak lagi menggunakan 'datetime.datetime' atau 'datetime.date'
+        # Cukup 'datetime' dan 'date' karena kita mengimpornya langsung
+        if isinstance(value, (datetime, date)):
+            # --- AKHIR PERUBAHAN ---
+            serialized[key] = value.isoformat()
+        elif isinstance(value, decimal.Decimal):
+            serialized[key] = float(value)
+        else:
+            serialized[key] = value
+    return serialized
+# --- AKHIR PERBAIKAN ---
+
+
+# --- ENDPOINT BARU 1: Mendapatkan SEMUA sesi yang masih terbuka ---
+@kasir_endpoints.route('/sesi/all-open', methods=['GET'])
+@jwt_required()
+def get_all_open_sessions():
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        # Kita join dengan tabel users untuk mendapatkan nama kasir
+        query = """
+            SELECT s.*, u.nama as nama_kasir 
+            FROM sesi_kasir s
+            JOIN users u ON s.id_user_kasir = u.id_user
+            WHERE s.status_sesi = 'Dibuka'
+            ORDER BY s.waktu_mulai DESC
+        """
+        cursor.execute(query)
+        sessions = cursor.fetchall()
+        safe_sessions = [serialize_session(s) for s in sessions]
+        return jsonify({"message": "OK", "sessions": safe_sessions}), 200
+    except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+# --- ENDPOINT BARU 2: Mendapatkan sesi yang baru ditutup (LIMIT 10) ---
+@kasir_endpoints.route('/sesi/recent-closed', methods=['GET'])
+@jwt_required()
+def get_recent_closed_sessions():
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        query = """
+            SELECT s.*, u.nama as nama_kasir
+            FROM sesi_kasir s
+            JOIN users u ON s.id_user_kasir = u.id_user
+            WHERE s.status_sesi = 'Ditutup'
+            ORDER BY s.waktu_selesai DESC
+            LIMIT 10
+        """
+        cursor.execute(query)
+        sessions = cursor.fetchall()
+        safe_sessions = [serialize_session(s) for s in sessions]
+        return jsonify({"message": "OK", "sessions": safe_sessions}), 200
+    except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+# --- ENDPOINT BARU 3: Untuk "Mengambil Alih" sesi yang terbuka ---
+@kasir_endpoints.route('/sesi/takeover', methods=['POST'])
+@jwt_required()
+def takeover_session():
+    # Dapatkan ID kasir BARU (yang sedang login)
+    jwt_identity = get_jwt_identity()
+    try:
+        id_user_kasir_baru = jwt_identity.get('id_user')
+        if not id_user_kasir_baru:
+            return jsonify({"message": "ERROR", "error": "Token tidak valid."}), 401
+    except AttributeError:
+        id_user_kasir_baru = jwt_identity
+
+    data = request.get_json()
+    id_sesi_ambil_alih = data.get('id_sesi')
+    if not id_sesi_ambil_alih:
+        return jsonify({"message": "ERROR", "error": "ID Sesi diperlukan."}), 400
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # Cek apakah kasir BARU ini sudah punya sesi aktif
+        cursor.execute(
+            "SELECT id_sesi FROM sesi_kasir WHERE id_user_kasir = %s AND status_sesi = 'Dibuka'", (id_user_kasir_baru,))
+        sesi_aktif_sendiri = cursor.fetchone()
+        if sesi_aktif_sendiri:
+            return jsonify({"message": "ERROR", "error": "Anda sudah memiliki sesi aktif. Tutup sesi Anda saat ini terlebih dahulu."}), 400
+
+        # Update sesi yang dituju dengan ID kasir BARU
+        query = """
+            UPDATE sesi_kasir
+            SET id_user_kasir = %s
+            WHERE id_sesi = %s AND status_sesi = 'Dibuka'
+        """
+        cursor.execute(query, (id_user_kasir_baru, id_sesi_ambil_alih))
+
+        if cursor.rowcount == 0:
+            return jsonify({"message": "ERROR", "error": "Sesi tidak ditemukan atau sudah ditutup."}), 404
+
+        connection.commit()
+        return jsonify({"message": "OK", "info": "Sesi berhasil diambil alih."}), 200
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+# --- PERBAIKI ENDPOINT INI ---
+@kasir_endpoints.route('/sesi/aktif', methods=['GET'])
+@jwt_required()
+def get_sesi_aktif():
+    # Ekstrak ID user (Kode ini sudah benar dari perbaikan sebelumnya)
+    jwt_identity = get_jwt_identity()
+    try:
+        id_user_kasir = jwt_identity.get('id_user')
+        if not id_user_kasir:
+            return jsonify({"message": "ERROR", "error": "Format token tidak valid."}), 401
+    except AttributeError:
+        id_user_kasir = jwt_identity
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # --- PERUBAHAN DI SINI: Tambahkan JOIN ke tabel users ---
+        query = """
+            SELECT s.*, u.nama as nama_kasir 
+            FROM sesi_kasir s
+            JOIN users u ON s.id_user_kasir = u.id_user 
+            WHERE s.id_user_kasir = %s AND s.status_sesi = 'Dibuka' 
+            LIMIT 1
+        """
+        cursor.execute(query, (id_user_kasir,))
+        # --- AKHIR PERUBAHAN ---
+
+        sesi_aktif_raw = cursor.fetchone()
+
+        if sesi_aktif_raw:
+            # Serialisasi hasil (Kode ini sudah benar)
+            sesi_aktif_safe = serialize_session(sesi_aktif_raw)
+            return jsonify({"message": "OK", "session": sesi_aktif_safe}), 200
+        else:
+            return jsonify({"message": "OK", "session": None}), 200
+
+    except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+# --- 4. ENDPOINT UNTUK DAPATKAN REKOMENDASI SALDO AWAL ---
+@kasir_endpoints.route('/sesi/saldo-terakhir', methods=['GET'])
+@jwt_required()
+def get_saldo_terakhir():
+    # Mengambil 'saldo_akhir_aktual' dari sesi YANG PALING TERAKHIR DITUTUP
+    # Ini sesuai deskripsi "sesuai uang dari shift 3"
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT saldo_akhir_aktual FROM sesi_kasir 
+            WHERE status_sesi = 'Ditutup' 
+            ORDER BY waktu_selesai DESC 
+            LIMIT 1
+        """)
+        last_session = cursor.fetchone()
+
+        saldo = 0.00
+        if last_session:
+            saldo = last_session['saldo_akhir_aktual']
+
+        return jsonify({"message": "OK", "saldo_terakhir": saldo}), 200
+
+    except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 def calculate_totals_and_validate_items(items_frontend):
@@ -33,17 +567,17 @@ def calculate_totals_and_validate_items(items_frontend):
             id_produk_str = item.get('id')
 
             if harga_str is None or jumlah_str is None or id_produk_str is None:
-                 raise ValueError(f"Data item tidak lengkap: {item}")
+                raise ValueError(f"Data item tidak lengkap: {item}")
 
             harga = decimal.Decimal(harga_str)
             jumlah = int(jumlah_str)
             id_produk = int(id_produk_str)
-            catatan = item.get('note') # Note bisa None/kosong
+            catatan = item.get('note')  # Note bisa None/kosong
 
             if jumlah <= 0:
-                 # Abaikan item dengan qty 0 atau negatif, atau lemparkan error jika perlu
-                 # raise ValueError(f"Jumlah item tidak valid: {jumlah} untuk produk ID {id_produk}")
-                 continue # Lewati item ini
+                # Abaikan item dengan qty 0 atau negatif, atau lemparkan error jika perlu
+                # raise ValueError(f"Jumlah item tidak valid: {jumlah} untuk produk ID {id_produk}")
+                continue  # Lewati item ini
 
             # Validasi tambahan (opsional): Cek apakah harga sesuai dengan DB?
             # cursor.execute("SELECT harga FROM produk_fnb WHERE id_produk = %s", (id_produk,))
@@ -55,7 +589,7 @@ def calculate_totals_and_validate_items(items_frontend):
             valid_detail_items_for_db.append({
                 'id_produk': id_produk,
                 'jumlah': jumlah,
-                'harga_saat_order': harga, # Simpan sebagai Decimal dulu
+                'harga_saat_order': harga,  # Simpan sebagai Decimal dulu
                 'catatan_pesanan': catatan
             })
         except (KeyError, ValueError, TypeError, decimal.InvalidOperation) as e:
@@ -66,27 +600,33 @@ def calculate_totals_and_validate_items(items_frontend):
             return None, None, f"Error validasi item: {str(e)}"
 
     if not valid_detail_items_for_db:
-         return None, None, "Tidak ada item valid dalam pesanan."
+        return None, None, "Tidak ada item valid dalam pesanan."
     if subtotal_backend <= 0:
-         return None, None, "Subtotal pesanan tidak valid (<= 0)."
+        return None, None, "Subtotal pesanan tidak valid (<= 0)."
 
-    return subtotal_backend, valid_detail_items_for_db, None # Sukses
+    return subtotal_backend, valid_detail_items_for_db, None  # Sukses
+
 
 def get_tax_percentage(cursor):
     """Helper untuk mengambil persentase pajak dari tabel settings."""
     try:
-        cursor.execute("SELECT `value` FROM `settings` WHERE `key` = 'PAJAK_FNB_PERSEN'")
+        cursor.execute(
+            "SELECT `value` FROM `settings` WHERE `key` = 'PAJAK_FNB_PERSEN'")
         setting_pajak = cursor.fetchone()
         if setting_pajak and setting_pajak.get('value'):
             return decimal.Decimal(setting_pajak['value'])
         else:
-            print("Warning: Setting PAJAK_FNB_PERSEN tidak ditemukan atau kosong. Menggunakan default 10%.")
+            print(
+                "Warning: Setting PAJAK_FNB_PERSEN tidak ditemukan atau kosong. Menggunakan default 10%.")
             return decimal.Decimal('10.00')
     except (mysql.connector.Error, decimal.InvalidOperation) as e:
-        print(f"Error mengambil atau parsing pajak dari DB: {e}. Menggunakan default 10%.")
+        print(
+            f"Error mengambil atau parsing pajak dari DB: {e}. Menggunakan default 10%.")
         return decimal.Decimal('10.00')
 
 # --- ENDPOINT SIMPAN ORDER ---
+
+
 @kasir_endpoints.route('/save-order', methods=['POST'])
 # @jwt_required() # Aktifkan jika perlu autentikasi
 def save_kasir_order():
@@ -102,37 +642,42 @@ def save_kasir_order():
             return jsonify({"message": "ERROR", "error": "Format data order tidak valid."}), 400
 
         # 1. Ekstrak data dari frontend
-        customer_name = data.get('customerName', 'Guest') # Default 'Guest' jika tidak ada
-        order_type_frontend = data.get('orderType') # 'dinein', 'takeaway', 'pickup'
+        # Default 'Guest' jika tidak ada
+        customer_name = data.get('customerName', 'Guest')
+        # 'dinein', 'takeaway', 'pickup'
+        order_type_frontend = data.get('orderType')
         room = data.get('room') if order_type_frontend == 'dinein' else None
         items_frontend = data.get('items', [])
         # Ambil diskon persentase dari frontend untuk perhitungan
         try:
-             discount_percentage_frontend = decimal.Decimal(data.get('discountPercentage', 0))
-             if not (0 <= discount_percentage_frontend <= 100):
-                  raise ValueError("Persentase diskon harus antara 0 dan 100.")
+            discount_percentage_frontend = decimal.Decimal(
+                data.get('discountPercentage', 0))
+            if not (0 <= discount_percentage_frontend <= 100):
+                raise ValueError("Persentase diskon harus antara 0 dan 100.")
         except (ValueError, decimal.InvalidOperation):
-             return jsonify({"message": "ERROR", "error": "Format persentase diskon tidak valid."}), 400
+            return jsonify({"message": "ERROR", "error": "Format persentase diskon tidak valid."}), 400
 
         # 2. Validasi Tipe Order
-        fnb_type_map = {'dinein': 'Dine In', 'takeaway': 'Takeaway', 'pickup': 'Pick Up'}
+        fnb_type_map = {'dinein': 'Dine In',
+                        'takeaway': 'Takeaway', 'pickup': 'Pick Up'}
         fnb_type_db = fnb_type_map.get(order_type_frontend)
         if not fnb_type_db:
-             return jsonify({"message": "ERROR", "error": f"Tipe order '{order_type_frontend}' tidak valid."}), 400
+            return jsonify({"message": "ERROR", "error": f"Tipe order '{order_type_frontend}' tidak valid."}), 400
 
         # --- Perhitungan Ulang di Backend ---
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
         # 3. Hitung Ulang Subtotal & Validasi Items
-        subtotal_backend, valid_items_db, item_error = calculate_totals_and_validate_items(items_frontend)
+        subtotal_backend, valid_items_db, item_error = calculate_totals_and_validate_items(
+            items_frontend)
         if item_error:
             return jsonify({"message": "ERROR", "error": item_error}), 400
 
         # 4. Hitung Ulang Diskon Nominal
         # Gunakan quantize untuk pembulatan standar 2 desimal
         discount_nominal_backend = (subtotal_backend * (discount_percentage_frontend / 100)).quantize(
-             decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP
         )
 
         # 5. Ambil Persentase Pajak dari DB
@@ -141,16 +686,17 @@ def save_kasir_order():
         # 6. Hitung Ulang Pajak Nominal
         taxable_amount_backend = subtotal_backend - discount_nominal_backend
         pajak_nominal_backend = (taxable_amount_backend * (pajak_persen_db / 100)).quantize(
-             decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP
         )
         # Pastikan pajak tidak negatif jika diskon > subtotal (meskipun seharusnya tidak terjadi)
-        if pajak_nominal_backend < 0: pajak_nominal_backend = decimal.Decimal('0.00')
-
+        if pajak_nominal_backend < 0:
+            pajak_nominal_backend = decimal.Decimal('0.00')
 
         # 7. Hitung Ulang Total Final
         total_harga_final_backend = taxable_amount_backend + pajak_nominal_backend
         # Pastikan total final tidak negatif
-        if total_harga_final_backend < 0: total_harga_final_backend = decimal.Decimal('0.00')
+        if total_harga_final_backend < 0:
+            total_harga_final_backend = decimal.Decimal('0.00')
 
         # --- Penyimpanan ke Database ---
         # 8. Insert ke tabel 'transaksi' dengan status 'Disimpan'
@@ -167,7 +713,7 @@ def save_kasir_order():
         values_transaksi = (
             customer_name, room, fnb_type_db,
             subtotal_backend, pajak_persen_db, pajak_nominal_backend, total_harga_final_backend,
-            'Disimpan', # Status kunci untuk order yang disimpan
+            'Disimpan',  # Status kunci untuk order yang disimpan
             'Baru',     # Status order awal
             None        # Placeholder untuk id_promo (isi jika ada)
         )
@@ -182,14 +728,15 @@ def save_kasir_order():
         """
         values_detail = [
             (id_transaksi_baru, item['id_produk'], item['jumlah'],
-             str(item['harga_saat_order']), # Konversi Decimal ke string untuk MySQL
+             # Konversi Decimal ke string untuk MySQL
+             str(item['harga_saat_order']),
              item.get('catatan_pesanan'),
-             'Baru') # Status awal item
+             'Baru')  # Status awal item
             for item in valid_items_db
         ]
         cursor.executemany(query_detail, values_detail)
 
-        connection.commit() # Simpan semua perubahan
+        connection.commit()  # Simpan semua perubahan
 
         return jsonify({
             "message": "OK",
@@ -198,20 +745,23 @@ def save_kasir_order():
         }), 201
 
     except mysql.connector.Error as db_err:
-        if connection: connection.rollback()
+        if connection:
+            connection.rollback()
         print(f"Database error saat menyimpan order: {db_err}")
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": f"Database error: {db_err.msg}"}), 500
     except Exception as e:
-        if connection: connection.rollback()
+        if connection:
+            connection.rollback()
         print(f"Error saat menyimpan order kasir: {str(e)}")
         traceback.print_exc()
         # Berikan pesan error yang lebih umum ke frontend
         return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal pada server."}), 500
     finally:
-        if cursor: cursor.close()
-        if connection and connection.is_connected(): connection.close()
-
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 
 @kasir_endpoints.route('/saved-order/<int:id_transaksi>', methods=['GET'])
@@ -260,23 +810,27 @@ def get_saved_order_detail(id_transaksi):
         response_data = {
             "id_transaksi": transaksi_data['id_transaksi'],
             "customerName": transaksi_data['nama_guest'],
-            "orderType": transaksi_data['fnb_type'].lower().replace(" ", ""), # Konversi 'Dine In' -> 'dinein'
+            # Konversi 'Dine In' -> 'dinein'
+            "orderType": transaksi_data['fnb_type'].lower().replace(" ", ""),
             "room": transaksi_data['lokasi_pemesanan'],
             # Kembalikan juga info harga dari transaksi jika perlu divalidasi/ditampilkan
             "subtotal": float(transaksi_data['subtotal']),
             "taxPercentage": float(transaksi_data['pajak_persen']),
             "taxNominal": float(transaksi_data['pajak_nominal']),
             "totalAmount": float(transaksi_data['total_harga_final']),
-            "tanggal_transaksi": transaksi_data['tanggal_transaksi'].isoformat(), # Format tanggal ISO
-             # Kembalikan persentase diskon jika Anda menyimpannya atau bisa menghitungnya kembali
-            "discountPercentage": 0.0, # Ganti jika Anda menyimpan/menghitungnya
+            # Format tanggal ISO
+            "tanggal_transaksi": transaksi_data['tanggal_transaksi'].isoformat(),
+            # Kembalikan persentase diskon jika Anda menyimpannya atau bisa menghitungnya kembali
+            "discountPercentage": 0.0,  # Ganti jika Anda menyimpan/menghitungnya
             "items": [
                 {
                     "id_detail_order": item['id_detail_order'],
                     "id_produk": item['id_produk'],
-                    "nama_produk": item['nama_produk'], # Kirim nama produk agar frontend tidak perlu fetch lagi
+                    # Kirim nama produk agar frontend tidak perlu fetch lagi
+                    "nama_produk": item['nama_produk'],
                     "jumlah": item['jumlah'],
-                    "harga_saat_order": float(item['harga_saat_order']), # Konversi Decimal
+                    # Konversi Decimal
+                    "harga_saat_order": float(item['harga_saat_order']),
                     "catatan_pesanan": item['catatan_pesanan'],
                     "status_pesanan": item['status_pesanan']
                     # Tambahkan field lain jika perlu (id_kategori, etc)
@@ -287,7 +841,8 @@ def get_saved_order_detail(id_transaksi):
         return jsonify(response_data), 200
 
     except mysql.connector.Error as db_err:
-        print(f"Database error saat mengambil detail order tersimpan: {db_err}")
+        print(
+            f"Database error saat mengambil detail order tersimpan: {db_err}")
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": f"Database error: {db_err.msg}"}), 500
     except Exception as e:
@@ -295,9 +850,10 @@ def get_saved_order_detail(id_transaksi):
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal pada server."}), 500
     finally:
-        if cursor: cursor.close()
-        if connection and connection.is_connected(): connection.close()
-
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 
 @kasir_endpoints.route('/pay-saved-order/<int:id_transaksi>', methods=['POST'])
@@ -315,53 +871,60 @@ def pay_saved_order(id_transaksi):
             return jsonify({"message": "ERROR", "error": "Format data pembayaran tidak valid."}), 400
 
         # 1. Ekstrak data pembayaran dan item terbaru dari frontend
-        payment_method_raw = data.get('paymentMethod') # 'CASH' atau 'QRIS' dari frontend
+        # 'CASH' atau 'QRIS' dari frontend
+        payment_method_raw = data.get('paymentMethod')
         items_frontend_updated = data.get('items', [])
         # Ambil detail lain yang mungkin diupdate (nama, room, diskon)
         customer_name = data.get('customerName', 'Guest')
-        order_type_frontend = data.get('orderType') # Seharusnya tidak berubah, tapi bisa divalidasi
+        # Seharusnya tidak berubah, tapi bisa divalidasi
+        order_type_frontend = data.get('orderType')
         room = data.get('room') if order_type_frontend == 'dinein' else None
         try:
-             discount_percentage_frontend = decimal.Decimal(data.get('discountPercentage', 0))
-             if not (0 <= discount_percentage_frontend <= 100):
-                  raise ValueError("Persentase diskon harus antara 0 dan 100.")
+            discount_percentage_frontend = decimal.Decimal(
+                data.get('discountPercentage', 0))
+            if not (0 <= discount_percentage_frontend <= 100):
+                raise ValueError("Persentase diskon harus antara 0 dan 100.")
         except (ValueError, decimal.InvalidOperation):
-             return jsonify({"message": "ERROR", "error": "Format persentase diskon tidak valid."}), 400
+            return jsonify({"message": "ERROR", "error": "Format persentase diskon tidak valid."}), 400
 
         # 2. Validasi Metode Pembayaran
         payment_map = {"QRIS": "Non-Tunai", "CASH": "Tunai"}
         metode_pembayaran_db = payment_map.get(payment_method_raw)
         if not metode_pembayaran_db:
-             return jsonify({"message": "ERROR", "error": f"Metode pembayaran '{payment_method_raw}' tidak valid."}), 400
+            return jsonify({"message": "ERROR", "error": f"Metode pembayaran '{payment_method_raw}' tidak valid."}), 400
 
         # --- Perhitungan Ulang (PENTING!) ---
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
         # 3. Cek apakah order memang ada dan statusnya 'Disimpan'
-        cursor.execute("SELECT status_pembayaran FROM transaksi WHERE id_transaksi = %s", (id_transaksi,))
+        cursor.execute(
+            "SELECT status_pembayaran FROM transaksi WHERE id_transaksi = %s", (id_transaksi,))
         existing_order = cursor.fetchone()
         if not existing_order:
-             return jsonify({"message": "ERROR", "error": "Order tidak ditemukan."}), 404
+            return jsonify({"message": "ERROR", "error": "Order tidak ditemukan."}), 404
         if existing_order['status_pembayaran'] != 'Disimpan':
-             return jsonify({"message": "ERROR", "error": f"Order ini tidak dalam status 'Disimpan' (Status: {existing_order['status_pembayaran']})."}), 400
+            return jsonify({"message": "ERROR", "error": f"Order ini tidak dalam status 'Disimpan' (Status: {existing_order['status_pembayaran']})."}), 400
 
         # 4. Hitung Ulang Subtotal & Validasi Item TERBARU
-        subtotal_backend, valid_items_db_updated, item_error = calculate_totals_and_validate_items(items_frontend_updated)
+        subtotal_backend, valid_items_db_updated, item_error = calculate_totals_and_validate_items(
+            items_frontend_updated)
         if item_error:
             # Tidak perlu rollback karena belum ada perubahan
             return jsonify({"message": "ERROR", "error": item_error}), 400
 
         # 5. Hitung Ulang Diskon, Pajak, dan Total Final TERBARU
         discount_nominal_backend = (subtotal_backend * (discount_percentage_frontend / 100)).quantize(
-             decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
         pajak_persen_db = get_tax_percentage(cursor)
         taxable_amount_backend = subtotal_backend - discount_nominal_backend
         pajak_nominal_backend = (taxable_amount_backend * (pajak_persen_db / 100)).quantize(
-             decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-        if pajak_nominal_backend < 0: pajak_nominal_backend = decimal.Decimal('0.00')
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        if pajak_nominal_backend < 0:
+            pajak_nominal_backend = decimal.Decimal('0.00')
         total_harga_final_backend = taxable_amount_backend + pajak_nominal_backend
-        if total_harga_final_backend < 0: total_harga_final_backend = decimal.Decimal('0.00')
+        if total_harga_final_backend < 0:
+            total_harga_final_backend = decimal.Decimal('0.00')
 
         # --- Update Database ---
         # 6. Update tabel 'transaksi'
@@ -389,12 +952,13 @@ def pay_saved_order(id_transaksi):
 
         # Cek apakah update berhasil (mempengaruhi 1 baris)
         if cursor.rowcount == 0:
-             connection.rollback() # Batalkan jika tidak ada baris yang terupdate
-             return jsonify({"message": "ERROR", "error": "Gagal mengupdate transaksi. Mungkin sudah dibayar atau ID salah."}), 400
+            connection.rollback()  # Batalkan jika tidak ada baris yang terupdate
+            return jsonify({"message": "ERROR", "error": "Gagal mengupdate transaksi. Mungkin sudah dibayar atau ID salah."}), 400
 
         # 7. Update tabel 'detail_order_fnb' (Hapus yang lama, insert yang baru)
         # Cara ini lebih mudah daripada mencocokkan item mana yang berubah/baru/dihapus.
-        cursor.execute("DELETE FROM detail_order_fnb WHERE id_transaksi = %s", (id_transaksi,))
+        cursor.execute(
+            "DELETE FROM detail_order_fnb WHERE id_transaksi = %s", (id_transaksi,))
 
         # Insert item terbaru
         query_insert_detail = """
@@ -406,38 +970,41 @@ def pay_saved_order(id_transaksi):
             (id_transaksi, item['id_produk'], item['jumlah'],
              str(item['harga_saat_order']),
              item.get('catatan_pesanan'),
-             'Baru') # Atau status lain jika diperlukan
+             'Baru')  # Atau status lain jika diperlukan
             for item in valid_items_db_updated
         ]
-        if values_insert_detail: # Hanya jalankan jika ada item valid
-             cursor.executemany(query_insert_detail, values_insert_detail)
+        if values_insert_detail:  # Hanya jalankan jika ada item valid
+            cursor.executemany(query_insert_detail, values_insert_detail)
         else:
-             # Jika semua item dihapus, mungkin perlu rollback atau handle kasus ini
-             connection.rollback()
-             return jsonify({"message": "ERROR", "error": "Tidak bisa menyelesaikan order tanpa item."}), 400
+            # Jika semua item dihapus, mungkin perlu rollback atau handle kasus ini
+            connection.rollback()
+            return jsonify({"message": "ERROR", "error": "Tidak bisa menyelesaikan order tanpa item."}), 400
 
-
-        connection.commit() # Simpan semua perubahan (update transaksi, delete & insert detail)
+        connection.commit()  # Simpan semua perubahan (update transaksi, delete & insert detail)
 
         return jsonify({
             "message": "OK",
             "info": f"Order #{id_transaksi} berhasil dibayar.",
-            "id_transaksi": id_transaksi # Kembalikan ID untuk konfirmasi
+            "id_transaksi": id_transaksi  # Kembalikan ID untuk konfirmasi
         }), 200
 
     except mysql.connector.Error as db_err:
-        if connection: connection.rollback()
+        if connection:
+            connection.rollback()
         print(f"Database error saat membayar order tersimpan: {db_err}")
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": f"Database error: {db_err.msg}"}), 500
     except Exception as e:
-        if connection: connection.rollback()
+        if connection:
+            connection.rollback()
         print(f"Error saat membayar order tersimpan: {str(e)}")
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal pada server."}), 500
     finally:
-        if cursor: cursor.close()
-        if connection and connection.is_connected(): connection.close()
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 
 @kasir_endpoints.route('/updatePaymentStatus/<int:trx_id>', methods=['PUT'])
@@ -457,12 +1024,12 @@ def update_payment_status(trx_id):
         """
         # Catatan: Saya mengasumsikan 'Non-Tunai' sebagai default saat kasir menekan tombol.
         # Anda bisa juga menerima 'metode_pembayaran' dari body request jika perlu.
-        
+
         cursor.execute(query, (trx_id,))
-        
+
         if cursor.rowcount == 0:
             return jsonify({"message": "ERROR", "error": "Transaksi tidak ditemukan"}), 404
-            
+
         connection.commit()
 
         return jsonify({
@@ -475,8 +1042,10 @@ def update_payment_status(trx_id):
             connection.rollback()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 @kasir_endpoints.route('/updateBatalStatus/<int:trx_id>', methods=['PUT'])
@@ -496,12 +1065,12 @@ def update_batal_status(trx_id):
         """
         # Catatan: Saya mengasumsikan 'Non-Tunai' sebagai default saat kasir menekan tombol.
         # Anda bisa juga menerima 'metode_pembayaran' dari body request jika perlu.
-        
+
         cursor.execute(query, (trx_id,))
-        
+
         if cursor.rowcount == 0:
             return jsonify({"message": "ERROR", "error": "Transaksi tidak ditemukan"}), 404
-            
+
         connection.commit()
 
         return jsonify({
@@ -514,9 +1083,10 @@ def update_batal_status(trx_id):
             connection.rollback()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
-
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 # =========================================================================================
@@ -551,7 +1121,8 @@ def get_rooms_for_today():
         rooms = cursor.fetchall()
 
         # Ambil semua paket harga untuk efisiensi
-        cursor.execute("SELECT id_ruangan, durasi_jam, harga_paket FROM paket_harga_ruangan;")
+        cursor.execute(
+            "SELECT id_ruangan, durasi_jam, harga_paket FROM paket_harga_ruangan;")
         all_packages = cursor.fetchall()
 
         # 2. Ambil semua jam yang sudah dibooking HARI INI
@@ -566,26 +1137,30 @@ def get_rooms_for_today():
         # 3. Proses dan gabungkan data
         for room in rooms:
             # Tambahkan paket harga ke setiap ruangan
-            room['paket_harga'] = [pkg for pkg in all_packages if pkg['id_ruangan'] == room['id_ruangan']]
+            room['paket_harga'] = [
+                pkg for pkg in all_packages if pkg['id_ruangan'] == room['id_ruangan']]
 
             # Tambahkan jam yang sudah terisi
             room['booked_hours'] = []
-            room_bookings = [b for b in bookings_today if b['id_ruangan'] == room['id_ruangan']]
+            room_bookings = [
+                b for b in bookings_today if b['id_ruangan'] == room['id_ruangan']]
             for booking in room_bookings:
                 start_hour = booking['waktu_mulai'].hour
                 end_hour = booking['waktu_selesai'].hour
                 # Tambahkan semua jam dari rentang booking
                 for hour in range(start_hour, end_hour):
                     room['booked_hours'].append(hour)
-        
+
         return jsonify({"message": "OK", "datas": rooms}), 200
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 # =========================================================================================
@@ -601,7 +1176,8 @@ def create_room_booking():
     cursor = None
     try:
         data = request.get_json()
-        required_fields = ['id_ruangan', 'durasi_jam', 'waktu_mulai_jam', 'nama_guest', 'metode_pembayaran', 'total_harga_final']
+        required_fields = ['id_ruangan', 'durasi_jam', 'waktu_mulai_jam',
+                           'nama_guest', 'metode_pembayaran', 'total_harga_final']
         if not all(field in data for field in required_fields):
             return jsonify({"message": "ERROR", "error": "Data tidak lengkap"}), 400
 
@@ -614,31 +1190,35 @@ def create_room_booking():
         end_hour = start_hour + int(data['durasi_jam'])
         waktu_mulai = f"{today_str} {start_hour:02d}:00:00"
         waktu_selesai = f"{today_str} {end_hour:02d}:00:00"
+        
+        booking_source = data.get("booking_source", "KasirWalkIn") # Default 'KasirWalkIn'
 
         # Validasi krusial: Cek apakah ada jadwal yang bentrok
         query_check = """
             SELECT COUNT(*) as count FROM booking_ruangan
             WHERE id_ruangan = %s AND (%s < waktu_selesai AND %s > waktu_mulai)
         """
-        cursor.execute(query_check, (data['id_ruangan'], waktu_mulai, waktu_selesai))
+        cursor.execute(
+            query_check, (data['id_ruangan'], waktu_mulai, waktu_selesai))
         if cursor.fetchone()[0] > 0:
             return jsonify({"message": "ERROR", "error": f"Jadwal pada jam {start_hour:02d}:00 - {end_hour:02d}:00 sudah terisi."}), 409
 
         # --- PERBAIKAN: HAPUS BARIS INI ---
-        # connection.start_transaction() 
+        # connection.start_transaction()
         # ------------------------------------
 
         # 1. Insert ke tabel 'transaksi' (Ini akan memulai transaksi secara implisit)
         query_transaksi = """
             INSERT INTO transaksi (
                 nama_guest, metode_pembayaran, total_harga_final, 
-                status_pembayaran, status_order
-            ) VALUES (%s, %s, %s, 'Lunas', 'Selesai');
+                status_pembayaran, status_order, booking_source
+            ) VALUES (%s, %s, %s, 'Lunas', 'Selesai', %s);
         """
         transaksi_values = (
             data['nama_guest'],
             data['metode_pembayaran'].capitalize(),
-            data['total_harga_final']
+            data['total_harga_final'],
+            booking_source
         )
         cursor.execute(query_transaksi, transaksi_values)
         id_transaksi_baru = cursor.lastrowid
@@ -658,7 +1238,7 @@ def create_room_booking():
         )
         cursor.execute(query_booking, booking_values)
 
-        connection.commit() # Simpan semua perubahan
+        connection.commit()  # Simpan semua perubahan
 
         return jsonify({
             "message": "OK",
@@ -667,12 +1247,15 @@ def create_room_booking():
         }), 201
 
     except Exception as e:
-        if connection: connection.rollback() # Batalkan semua perubahan jika ada error
+        if connection:
+            connection.rollback()  # Batalkan semua perubahan jika ada error
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 # Fungsi helper untuk menentukan level warna berdasarkan sisa waktu
@@ -685,6 +1268,7 @@ def create_room_booking():
 #         return "yellow"
 #     else: # Kurang dari 15 menit
 #         return "red"
+
 
 @kasir_endpoints.route('/dashboard-data', methods=['GET'])
 def get_kasir_dashboard_data():
@@ -699,7 +1283,7 @@ def get_kasir_dashboard_data():
     try:
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
-        
+
         # --- 1. Data Ringkasan Atas ---
         # Today's Transaction
         query_today_transaction = """
@@ -717,7 +1301,7 @@ def get_kasir_dashboard_data():
         """
         cursor.execute(query_active_rentals)
         active_rentals_count = cursor.fetchone()['count'] or 0
-        
+
         # Total Rooms and Available Rooms
         query_total_rooms = "SELECT COUNT(id_ruangan) as count FROM ruangan WHERE status_ketersediaan = 'Active';"
         cursor.execute(query_total_rooms)
@@ -729,7 +1313,7 @@ def get_kasir_dashboard_data():
             "spaceRental": active_rentals_count,
             "spaceAvailable": available_rooms_count
         }
-        
+
         # --- 2. Data Tipe Unit Ruangan ---
         query_space_types = """
             SELECT 
@@ -757,17 +1341,19 @@ def get_kasir_dashboard_data():
             );
         """
         cursor.execute(query_available_units)
-        available_units_data = [row['nama_ruangan'] for row in cursor.fetchall()]
+        available_units_data = [row['nama_ruangan']
+                                for row in cursor.fetchall()]
 
         # --- 4. Data Sewa (Aktif, Selesai, & Akan Datang Hari Ini) ---
         query_rentals = """
             SELECT 
-                br.id_booking as id,
-                COALESCE(u.nama, t.nama_guest) as client,
-                r.nama_ruangan as unit,
-                t.total_harga_final as price,
+                br.id_booking AS id,
+                COALESCE(u.nama, t.nama_guest) AS client,
+                r.nama_ruangan AS unit,
+                t.total_harga_final AS price,
                 br.waktu_mulai,
-                br.waktu_selesai
+                br.waktu_selesai,
+                t.booking_source  -- <-- Tambahkan baris ini
             FROM booking_ruangan br
             JOIN transaksi t ON br.id_transaksi = t.id_transaksi
             JOIN ruangan r ON br.id_ruangan = r.id_ruangan
@@ -777,7 +1363,6 @@ def get_kasir_dashboard_data():
         """
         cursor.execute(query_rentals)
         all_rentals_today = cursor.fetchall()
-
         # MODIFIKASI: Buat 3 list untuk menampung status yang berbeda
         rentals_upcoming = []
         rentals_active = []
@@ -788,10 +1373,10 @@ def get_kasir_dashboard_data():
             # Format data dasar
             rental['price'] = int(rental['price'])
             rental['date'] = rental['waktu_mulai'].strftime('%d/%m/%Y %H:%M')
-            
+
             waktu_mulai_obj = rental['waktu_mulai']
             waktu_selesai_obj = rental['waktu_selesai']
-            
+
             rental['waktu_mulai'] = waktu_mulai_obj.isoformat()
             rental['waktu_selesai'] = waktu_selesai_obj.isoformat()
 
@@ -836,12 +1421,12 @@ def get_kasir_dashboard_data():
 #     try:
 #         connection = get_connection()
 #         cursor = connection.cursor(dictionary=True)
-        
+
 #         # --- 1. Data Ringkasan Atas ---
 #         # Today's Transaction
 #         query_today_transaction = """
-#         SELECT SUM(total_harga_final) as total 
-#         FROM transaksi 
+#         SELECT SUM(total_harga_final) as total
+#         FROM transaksi
 #         WHERE DATE(tanggal_transaksi) = CURDATE() AND status_pembayaran = 'Lunas';
 #         """
 #         cursor.execute(query_today_transaction)
@@ -849,12 +1434,12 @@ def get_kasir_dashboard_data():
 
 #         # Active Space Rental
 #         query_active_rentals = """
-#         SELECT COUNT(id_booking) as count FROM booking_ruangan 
+#         SELECT COUNT(id_booking) as count FROM booking_ruangan
 #         WHERE NOW() BETWEEN waktu_mulai AND waktu_selesai;
 #         """
 #         cursor.execute(query_active_rentals)
 #         active_rentals_count = cursor.fetchone()['count'] or 0
-        
+
 #         # Total Rooms and Available Rooms
 #         query_total_rooms = "SELECT COUNT(id_ruangan) as count FROM ruangan WHERE status_ketersediaan = 'Active';"
 #         cursor.execute(query_total_rooms)
@@ -866,14 +1451,14 @@ def get_kasir_dashboard_data():
 #             "spaceRental": active_rentals_count,
 #             "spaceAvailable": available_rooms_count
 #         }
-        
+
 #         # --- 2. Data Tipe Unit Ruangan ---
 #         query_space_types = """
-#             SELECT 
-#                 kr.nama_kategori as name, 
+#             SELECT
+#                 kr.nama_kategori as name,
 #                 COUNT(r.id_ruangan) as total,
 #                 (COUNT(r.id_ruangan) - (
-#                     SELECT COUNT(br.id_booking) 
+#                     SELECT COUNT(br.id_booking)
 #                     FROM booking_ruangan br
 #                     JOIN ruangan r_inner ON br.id_ruangan = r_inner.id_ruangan
 #                     WHERE r_inner.id_kategori_ruangan = kr.id_kategori_ruangan AND NOW() BETWEEN br.waktu_mulai AND br.waktu_selesai
@@ -888,7 +1473,7 @@ def get_kasir_dashboard_data():
 
 #         # --- 3. Data Unit yang Tersedia ---
 #         query_available_units = """
-#             SELECT nama_ruangan FROM ruangan 
+#             SELECT nama_ruangan FROM ruangan
 #             WHERE status_ketersediaan = 'Active' AND id_ruangan NOT IN (
 #                 SELECT id_ruangan FROM booking_ruangan WHERE NOW() BETWEEN waktu_mulai AND waktu_selesai
 #             );
@@ -899,7 +1484,7 @@ def get_kasir_dashboard_data():
 
 #         # --- 4. Data Sewa (Aktif & Selesai Hari Ini) ---
 #         query_rentals = """
-#             SELECT 
+#             SELECT
 #                 br.id_booking as id,
 #                 COALESCE(u.nama, t.nama_guest) as client,
 #                 r.nama_ruangan as unit,
@@ -916,16 +1501,16 @@ def get_kasir_dashboard_data():
 #         """
 #         cursor.execute(query_rentals)
 #         all_rentals_today = cursor.fetchall()
-        
+
 #         rentals_active = []
 #         rentals_finish = []
-        
+
 #         now = datetime.now()
 #         for rental in all_rentals_today:
 #             # Format ulang data untuk frontend
 #             rental['price'] = int(rental['price'])
 #             rental['date'] = rental['waktu_mulai'].strftime('%d/%m/%Y %H:%M')
-            
+
 #             if now >= rental['waktu_mulai'] and now <= rental['waktu_selesai']:
 #                 time_left = rental['waktu_selesai'] - now
 #                 time_left_seconds = time_left.total_seconds()
@@ -959,6 +1544,7 @@ def get_kasir_dashboard_data():
 #         if 'connection' in locals() and connection.is_connected():
 #             cursor.close()
 #             connection.close()
+
 
 @kasir_endpoints.route("/historyKasir", methods=["GET"])
 def get_history_kasir():
@@ -1014,6 +1600,7 @@ def get_history_kasir():
             cursor.close()
         if conn:
             conn.close()
+
 
 @kasir_endpoints.route("/readProdukKasir", methods=["GET"])
 def read_produk_kasir():
@@ -1072,6 +1659,7 @@ def get_pos_init_data():
                 p.nama_produk AS name,
                 p.harga AS price,
                 p.status_ketersediaan,
+                p.status_visibilitas,
                 k.id_tenant AS merchantId,
                 k.nama_kategori AS category
             FROM produk_fnb p
@@ -1080,7 +1668,7 @@ def get_pos_init_data():
         """
         cursor.execute(query_products)
         products_raw = cursor.fetchall()
-        
+
         # Logika ini sudah benar, akan mengubah status menjadi true/false
         products = [
             {**p, "available": p.pop('status_ketersediaan') == 'Active'}
@@ -1091,14 +1679,16 @@ def get_pos_init_data():
         query_merchants = "SELECT id_tenant AS id, nama_tenant AS name FROM tenants ORDER BY name;"
         cursor.execute(query_merchants)
         merchant_categories = cursor.fetchall()
-        merchant_categories.insert(0, {'id': 'all_merchants', 'name': 'All Merchants'})
+        merchant_categories.insert(
+            0, {'id': 'all_merchants', 'name': 'All Merchants'})
 
         # 3. Ambil kategori produk (tipe) - (Tidak ada perubahan)
         query_product_types = "SELECT DISTINCT nama_kategori AS name FROM kategori_produk ORDER BY name;"
         cursor.execute(query_product_types)
         product_types_raw = cursor.fetchall()
         product_type_categories = [{'id': 'all_types', 'name': 'All Types'}]
-        product_type_categories.extend([{'id': pt['name'], 'name': pt['name']} for pt in product_types_raw])
+        product_type_categories.extend(
+            [{'id': pt['name'], 'name': pt['name']} for pt in product_types_raw])
 
         # 4. Data tipe order - (Tidak ada perubahan)
         order_types = [
@@ -1106,17 +1696,19 @@ def get_pos_init_data():
             {'id': 'takeaway', 'name': 'Take Away'},
             {'id': 'pickup', 'name': 'Pick Up'}
         ]
-        
+
         # --- TAMBAHAN: Ambil Persentase Pajak F&B ---
-        cursor.execute("SELECT `value` FROM `settings` WHERE `key` = 'PAJAK_FNB_PERSEN'")
+        cursor.execute(
+            "SELECT `value` FROM `settings` WHERE `key` = 'PAJAK_FNB_PERSEN'")
         setting_pajak = cursor.fetchone()
-        pajak_fnb_persen = 10.0 # Default fallback jika tidak ada di DB atau error
+        pajak_fnb_persen = 10.0  # Default fallback jika tidak ada di DB atau error
         if setting_pajak and setting_pajak['value']:
             try:
                 # Coba konversi ke float
                 pajak_fnb_persen = float(setting_pajak['value'])
             except ValueError:
-                print(f"Warning: Nilai PAJAK_FNB_PERSEN ('{setting_pajak['value']}') di DB tidak valid. Menggunakan default {pajak_fnb_persen}%.")
+                print(
+                    f"Warning: Nilai PAJAK_FNB_PERSEN ('{setting_pajak['value']}') di DB tidak valid. Menggunakan default {pajak_fnb_persen}%.")
         # --- AKHIR TAMBAHAN ---
 
         # Gabungkan semua data menjadi satu respons - (Tidak ada perubahan)
@@ -1140,9 +1732,9 @@ def get_pos_init_data():
             connection.close()
 
 
-#=========================================================================================
+# =========================================================================================
 # ENDPOINT 2: Membuat order baru dari kasir
-#=========================================================================================
+# =========================================================================================
 
 
 # @kasir_endpoints.route('/order', methods=['POST'])
@@ -1160,7 +1752,7 @@ def get_pos_init_data():
 
 #         connection = get_connection()
 #         cursor = connection.cursor()
-        
+
 #         # Mulai transaksi database
 #         connection.start_transaction()
 
@@ -1187,7 +1779,7 @@ def get_pos_init_data():
 #             data.get('totalAmount')
 #         )
 #         cursor.execute(query_transaksi, transaksi_values)
-        
+
 #         # Ambil ID dari transaksi yang baru saja dibuat
 #         id_transaksi_baru = cursor.lastrowid
 
@@ -1230,15 +1822,46 @@ def get_pos_init_data():
 
 
 @kasir_endpoints.route('/order', methods=['POST'])
-# @jwt_required() # Jika perlu autentikasi
+@jwt_required()
 def create_kasir_order_with_tax():
     """
-    Menerima data order dari POS Kasir, menghitung ulang total dengan diskon & pajak,
-    dan menyimpannya ke database (disesuaikan dengan db_sistem_pos_v19).
+    Menerima data order dari POS Kasir, memvalidasi sesi kasir yang aktif,
+    menghitung ulang total, dan menyimpannya ke database.
     """
+
+    # --- PERBAIKAN: Ekstrak ID dari identity ---
+    jwt_identity = get_jwt_identity()
+    try:
+        # Asumsi key di dalam token Anda adalah 'id_user'
+        id_user_kasir = jwt_identity.get('id_user')
+        if not id_user_kasir:
+            return jsonify({"message": "ERROR", "error": "Format token tidak valid."}), 401
+    except AttributeError:
+        # Fallback jika identity BUKAN dictionary
+        id_user_kasir = jwt_identity
+    # --- AKHIR PERBAIKAN ---
+
     connection = None
     cursor = None
     try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # --- VALIDASI SESI AKTIF ---
+        # Query ini sekarang aman karena id_user_kasir adalah integer
+        cursor.execute("""
+            SELECT id_sesi FROM sesi_kasir 
+            WHERE id_user_kasir = %s AND status_sesi = 'Dibuka' 
+            LIMIT 1
+        """, (id_user_kasir,))
+        sesi_aktif = cursor.fetchone()
+
+        if not sesi_aktif:
+            return jsonify({"message": "ERROR", "error": "Tidak ada sesi kasir yang aktif. Silakan buka sesi baru."}), 403
+
+        id_sesi_aktif = sesi_aktif['id_sesi']
+        # --- AKHIR VALIDASI SESI ---
+
         data = request.get_json()
         if not data or 'items' not in data or not data['items']:
             return jsonify({"message": "ERROR", "error": "Data order tidak valid atau item kosong."}), 400
@@ -1249,85 +1872,94 @@ def create_kasir_order_with_tax():
         room = data.get('room') if order_type_frontend == 'dinein' else None
         payment_method_raw = data.get('paymentMethod')
         items_frontend = data.get('items')
-        # Meskipun tidak disimpan, kita tetap perlu persentase diskon untuk perhitungan
-        discount_percentage_frontend = decimal.Decimal(data.get('discountPercentage', 0))
+        discount_percentage_frontend = decimal.Decimal(
+            data.get('discountPercentage', 0))
 
         # 2. Validasi & Mapping (tetap sama)
-        fnb_type_map = {'dinein': 'Dine In', 'takeaway': 'Takeaway', 'pickup': 'Pick Up'}
+        fnb_type_map = {'dinein': 'Dine In',
+                        'takeaway': 'Takeaway', 'pickup': 'Pick Up'}
         fnb_type_db = fnb_type_map.get(order_type_frontend)
-        if not fnb_type_db: return jsonify({"message": "ERROR", "error": f"Tipe order '{order_type_frontend}' tidak valid."}), 400
+        if not fnb_type_db:
+            return jsonify({"message": "ERROR", "error": f"Tipe order '{order_type_frontend}' tidak valid."}), 400
         payment_map = {"QRIS": "Non-Tunai", "CASH": "Tunai"}
         metode_pembayaran_db = payment_map.get(payment_method_raw)
-        if not metode_pembayaran_db: return jsonify({"message": "ERROR", "error": f"Metode pembayaran '{payment_method_raw}' tidak valid."}), 400
+        if not metode_pembayaran_db:
+            return jsonify({"message": "ERROR", "error": f"Metode pembayaran '{payment_method_raw}' tidak valid."}), 400
 
-        # --- PERHITUNGAN ULANG DI BACKEND --- (tetap sama)
-        connection = get_connection()
-        cursor = connection.cursor(dictionary=True)
-
+        # (Sisa kode perhitungan Anda dari #3 hingga #7 sudah benar)
+        # ... (Perhitungan subtotal_backend, pajak_nominal_backend, dll.) ...
         # 3. Hitung Ulang Subtotal & Validasi Items (tetap sama)
         subtotal_backend = decimal.Decimal(0.00)
         valid_detail_items_for_db = []
-        # ... (loop validasi item tetap sama) ...
         for item in items_frontend:
-             try:
-                 harga = decimal.Decimal(item['price'])
-                 jumlah = int(item['qty'])
-                 id_produk = int(item['id'])
-                 catatan = item.get('note')
-                 if jumlah > 0:
-                     subtotal_backend += harga * jumlah
-                     valid_detail_items_for_db.append({
-                         'id_produk': id_produk, 'jumlah': jumlah,
-                         'harga_saat_order': harga, 'catatan_pesanan': catatan
-                     })
-             except (KeyError, ValueError, TypeError, decimal.InvalidOperation) as e:
-                 return jsonify({"message": "ERROR", "error": f"Data item tidak valid: {str(e)}"}), 400
-        if subtotal_backend <= 0: return jsonify({"message": "ERROR", "error": "Order kosong."}), 400
+            try:
+                harga = decimal.Decimal(item['price'])
+                jumlah = int(item['qty'])
+                id_produk = int(item['id'])
+                catatan = item.get('note')
+                if jumlah > 0:
+                    subtotal_backend += harga * jumlah
+                    valid_detail_items_for_db.append({
+                        'id_produk': id_produk, 'jumlah': jumlah,
+                        'harga_saat_order': harga, 'catatan_pesanan': catatan
+                    })
+            except (KeyError, ValueError, TypeError, decimal.InvalidOperation) as e:
+                return jsonify({"message": "ERROR", "error": f"Data item tidak valid: {str(e)}"}), 400
+        if subtotal_backend <= 0:
+            return jsonify({"message": "ERROR", "error": "Order kosong."}), 400
 
-        # 4. Hitung Ulang Diskon Nominal (tetap sama, meskipun tidak disimpan)
-        discount_nominal_backend = (subtotal_backend * (discount_percentage_frontend / 100)).quantize(decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        # 4. Hitung Ulang Diskon Nominal (tetap sama)
+        discount_nominal_backend = (subtotal_backend * (discount_percentage_frontend / 100)
+                                    ).quantize(decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
 
         # 5. Ambil Persentase Pajak dari DB (tetap sama)
-        cursor.execute("SELECT `value` FROM `settings` WHERE `key` = 'PAJAK_FNB_PERSEN'")
+        cursor.execute(
+            "SELECT `value` FROM `settings` WHERE `key` = 'PAJAK_FNB_PERSEN'")
         setting_pajak = cursor.fetchone()
         pajak_persen_db = decimal.Decimal(10.00)
         if setting_pajak and setting_pajak['value']:
-             try: pajak_persen_db = decimal.Decimal(setting_pajak['value'])
-             except decimal.InvalidOperation: print(f"Warning: Pajak '{setting_pajak['value']}' di DB tidak valid.")
+            try:
+                pajak_persen_db = decimal.Decimal(setting_pajak['value'])
+            except decimal.InvalidOperation:
+                print(
+                    f"Warning: Pajak '{setting_pajak['value']}' di DB tidak valid.")
 
         # 6. Hitung Ulang Pajak Nominal (tetap sama)
         taxable_amount_backend = subtotal_backend - discount_nominal_backend
-        pajak_nominal_backend = (taxable_amount_backend * (pajak_persen_db / 100)).quantize(decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        pajak_nominal_backend = (taxable_amount_backend * (pajak_persen_db / 100)).quantize(
+            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
 
         # 7. Hitung Ulang Total Final (tetap sama)
         total_harga_final_backend = taxable_amount_backend + pajak_nominal_backend
 
         # --- PENYIMPANAN KE DATABASE ---
 
-        # 8. Insert ke tabel master 'transaksi' (TANPA KOLOM DISKON)
-        # --> PERUBAHAN DI SINI <--
+        # 8. Insert ke tabel master 'transaksi'
         query_transaksi = """
             INSERT INTO transaksi (
                 nama_guest, lokasi_pemesanan, fnb_type, metode_pembayaran,
                 subtotal, pajak_persen, pajak_nominal, total_harga_final,
-                status_pembayaran, status_order, tanggal_transaksi
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-        """ # Total 10 Kolom (tanpa tanggal), 10 Placeholder
+                status_pembayaran, status_order, tanggal_transaksi,
+                id_user, id_sesi
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
+        """
+
+        # Values ini sekarang aman karena id_user_kasir adalah integer
         values_transaksi = (
             customer_name, room, fnb_type_db, metode_pembayaran_db,
-            subtotal_backend, # Kolom diskon dihapus
-            pajak_persen_db, pajak_nominal_backend, total_harga_final_backend, # Simpan pajak
-            'Lunas', # Status Pembayaran Kasir
-            'Baru'   # Status Order awal
-        ) # Total 10 Nilai
-        # --> AKHIR PERUBAHAN <--
+            subtotal_backend,
+            pajak_persen_db, pajak_nominal_backend, total_harga_final_backend,
+            'Lunas', 'Baru',
+            id_user_kasir,  # <-- Ini sekarang INT (angka)
+            id_sesi_aktif
+        )
+
         cursor.execute(query_transaksi, values_transaksi)
         id_transaksi_baru = cursor.lastrowid
 
         # 9. Insert ke tabel detail 'detail_order_fnb' (tetap sama)
         if not valid_detail_items_for_db:
-             # Tidak perlu rollback karena belum commit
-             return jsonify({"message": "ERROR", "error": "Tidak ada item valid."}), 400
+            return jsonify({"message": "ERROR", "error": "Tidak ada item valid."}), 400
         query_detail = """
             INSERT INTO detail_order_fnb
             (id_transaksi, id_produk, jumlah, harga_saat_order, catatan_pesanan, status_pesanan)
@@ -1335,41 +1967,46 @@ def create_kasir_order_with_tax():
         """
         values_detail = [
             (id_transaksi_baru, item['id_produk'], item['jumlah'],
-             str(item['harga_saat_order']), # Konversi decimal ke string untuk execute
+             str(item['harga_saat_order']),
              item.get('catatan_pesanan'),
              'Baru')
             for item in valid_detail_items_for_db
         ]
         cursor.executemany(query_detail, values_detail)
 
-        connection.commit() # Simpan perubahan
+        connection.commit()  # Simpan perubahan
 
         # 10. Kembalikan ID transaksi baru (tetap sama)
         return jsonify({"message": "OK", "info": "Order berhasil dibuat", "id_transaksi": id_transaksi_baru}), 201
 
-    # Exception Handling (tetap sama)
+    # (Exception Handling Anda tetap sama)
     except (decimal.InvalidOperation, ValueError, TypeError) as e:
-        if connection: connection.rollback()
+        if connection:
+            connection.rollback()
         print(f"Data validation error in Kasir Order: {str(e)}")
         return jsonify({"message": "ERROR", "error": f"Format data tidak valid: {str(e)}"}), 400
     except KeyError as e:
-        if connection: connection.rollback()
+        if connection:
+            connection.rollback()
         print(f"Missing key error in Kasir Order: {str(e)}")
         return jsonify({"message": "ERROR", "error": f"Data JSON tidak lengkap: field '{str(e)}' tidak ada."}), 400
-    except mysql.connector.Error as db_err: # Tangkap error DB spesifik
-         if connection: connection.rollback()
-         print(f"Database error in Kasir Order: {db_err}")
-         traceback.print_exc()
-         return jsonify({"message": "ERROR", "error": "Terjadi masalah saat menyimpan data ke database."}), 500
+    except mysql.connector.Error as db_err:
+        if connection:
+            connection.rollback()
+        print(f"Database error in Kasir Order: {db_err}")
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": "Terjadi masalah saat menyimpan data ke database."}), 500
     except Exception as e:
-        if connection: connection.rollback()
+        if connection:
+            connection.rollback()
         print(f"Error saat membuat order kasir: {str(e)}")
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal pada server."}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
-
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 @kasir_endpoints.route('/productsKasir', methods=['GET'])
@@ -1409,8 +2046,10 @@ def get_products():
     except Exception as e:
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 # halaman transaksiKasir start
@@ -1478,11 +2117,12 @@ def readTransaksiKasir():
         data = {}
         for row in rows:
             trx_id = row["id_transaksi"]
-            
+
             if trx_id not in data:
                 # Tentukan type
                 if row["jenis_transaksi"] == "fnb":
-                    order_type = row["fnb_type"] or "Takeaway"  # default jika null
+                    # default jika null
+                    order_type = row["fnb_type"] or "Takeaway"
                 elif row["jenis_transaksi"] == "booking":
                     order_type = "Booking"
                 else:
@@ -1501,7 +2141,7 @@ def readTransaksiKasir():
                     "items": [],
                     "bookings": []
                 }
-            
+
             # Tambahkan item F&B jika ada
             if row["id_detail_order"]:
                 data[trx_id]["items"].append({
@@ -1512,7 +2152,7 @@ def readTransaksiKasir():
                     "note": row["catatan_pesanan"],
                     "fnb_type": row["fnb_type"]  # simpan di item juga opsional
                 })
-            
+
             # Tambahkan booking ruangan jika ada
             if row["id_booking"]:
                 booking_data = {
@@ -1533,12 +2173,14 @@ def readTransaksiKasir():
             "datas": list(data.values())
         }), 200
 
-
     except Exception as e:
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
 
 @kasir_endpoints.route('/readTransaksiKasirs', methods=['GET'])
 def readTransaksiKasirs():
@@ -1607,20 +2249,22 @@ def readTransaksiKasirs():
         final_data = []
         # Langkah 2: Iterasi setiap transaksi yang sudah dikelompokkan
         for trx_id, trx_rows in grouped_data.items():
-            
+
             first_row = trx_rows[0]
-            
+
             if first_row["jenis_transaksi"] not in ("fnb", "booking"):
                 continue
 
             # --- LOGIKA BARU: Kalkulasi Status Pesanan Dinamis ---
-            fnb_items = [r for r in trx_rows if r['id_detail_order'] is not None]
-            overall_status = first_row["status_order"] # Ambil status default dari transaksi
+            fnb_items = [
+                r for r in trx_rows if r['id_detail_order'] is not None]
+            # Ambil status default dari transaksi
+            overall_status = first_row["status_order"]
 
             if fnb_items:
                 # Kumpulkan semua status unik dari item-item F&B
                 item_statuses = {item['status_item'] for item in fnb_items}
-                
+
                 # Terapkan aturan yang Anda inginkan
                 if all(s == 'Selesai' for s in item_statuses):
                     overall_status = 'Selesai'
@@ -1633,18 +2277,18 @@ def readTransaksiKasirs():
                 elif all(s == 'Baru' for s in item_statuses):
                     overall_status = 'Baru'
                 # Jika ada kombinasi lain (misal: Baru & Batal), status tidak berubah dari default
-            
+
             # --- AKHIR LOGIKA BARU ---
 
             order_type = "Booking"
             if first_row["jenis_transaksi"] == "fnb":
                 order_type = first_row["fnb_type"] or "Takeout"
-            
+
             transaction_entry = {
                 "id": trx_id,
                 "customer": first_row["customer_name"],
                 "location": first_row["lokasi_pemesanan"],
-                "status_pesanan": overall_status, # Gunakan status yang sudah dihitung
+                "status_pesanan": overall_status,  # Gunakan status yang sudah dihitung
                 "payment_status": first_row["status_pembayaran"],
                 "payment_method": first_row["metode_pembayaran"],
                 "total": float(first_row["total_harga_final"]),
@@ -1664,9 +2308,10 @@ def readTransaksiKasirs():
                         "qty": row["jumlah"],
                         "price": float(row["harga_saat_order"]),
                         "note": row["catatan_pesanan"],
-                        "status": row["status_item"] # Status individual per item
+                        # Status individual per item
+                        "status": row["status_item"]
                     })
-                
+
                 if row["id_booking"] and row["id_booking"] not in processed_bookings:
                     transaction_entry["bookings"].append({
                         "id_booking": row["id_booking"],
@@ -1678,7 +2323,7 @@ def readTransaksiKasirs():
                         "duration": row["durasi"]
                     })
                     processed_bookings.add(row["id_booking"])
-            
+
             final_data.append(transaction_entry)
 
         return jsonify({
@@ -1689,10 +2334,11 @@ def readTransaksiKasirs():
     except Exception as e:
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
-        
-        
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
 # halaman transaksiKasir end
 
 
@@ -1773,11 +2419,10 @@ def readMerchantOrders():
     except Exception as e:
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
-
-
-
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 # halaman merchantkasir end
@@ -1791,13 +2436,13 @@ def readKasir_transaksi():
     try:
         # Query ini mengambil data transaksi dan menggabungkannya dengan nama pelanggan (baik dari tabel users maupun guest)
         query = """
-            SELECT 
-                t.id_transaksi, 
+            SELECT
+                t.id_transaksi,
                 t.status_pembayaran,
-                t.status_order, 
-                t.total_harga_final, 
-                t.lokasi_pemesanan, 
-                COALESCE(u.nama, t.nama_guest) AS nama_pelanggan, 
+                t.status_order,
+                t.total_harga_final,
+                t.lokasi_pemesanan,
+                COALESCE(u.nama, t.nama_guest) AS nama_pelanggan,
                 t.tanggal_transaksi
             FROM transaksi t
             LEFT JOIN users u ON t.id_user = u.id_user
@@ -1813,6 +2458,7 @@ def readKasir_transaksi():
         cursor.close()
         conn.close()
 
+
 @kasir_endpoints.route('/createKasir', methods=['POST'])
 @jwt_required()
 def createKasir_transaksi():
@@ -1821,7 +2467,7 @@ def createKasir_transaksi():
     cursor = conn.cursor()
     try:
         data = request.get_json()
-        
+
         # Validasi data input sederhana
         customer_name = data.get('name')
         lokasi = data.get('room')
@@ -1830,23 +2476,24 @@ def createKasir_transaksi():
             return jsonify({"message": "Nama pelanggan tidak boleh kosong"}), 400
 
         query = """
-            INSERT INTO transaksi 
+            INSERT INTO transaksi
                 (nama_guest, lokasi_pemesanan, total_harga_final, status_pembayaran, status_order) 
             VALUES (%s, %s, 0, 'Belum Lunas', 'Baru');
         """
         cursor.execute(query, (customer_name, lokasi))
         conn.commit()
-        
+
         return jsonify({
-            "message": "Order baru berhasil dibuat", 
+            "message": "Order baru berhasil dibuat",
             "id_transaksi": cursor.lastrowid
-        }), 201 # 201 Created
+        }), 201  # 201 Created
     except Exception as e:
         conn.rollback()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         cursor.close()
         conn.close()
+
 
 @kasir_endpoints.route('/read', methods=['GET'])
 def read():
@@ -1868,53 +2515,128 @@ def read():
         if connection:
             connection.close()
 
+
 @kasir_endpoints.route('/transaksi', methods=['GET'])
 def get_all_transaksi():
-    """Endpoint untuk mendapatkan daftar transaksi yang sudah diformat."""
+    """Endpoint untuk mendapatkan daftar transaksi yang sudah diformat,
+       TERMASUK detail booking ruangan beserta kategorinya."""
     connection = None
     cursor = None
     try:
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # Query ini telah diperbaiki sesuai skema database final kita
+        # === PERUBAHAN UTAMA DI DALAM QUERY ===
         query = """
             SELECT
                 t.id_transaksi AS id,
                 COALESCE(u.nama, t.nama_guest) AS name,
-                t.lokasi_pemesanan AS type,
+                t.lokasi_pemesanan AS type, -- Mungkin perlu penyesuaian logika 'type'
                 CASE
                     WHEN t.status_pembayaran = 'Lunas' THEN 'SUCCESS'
-                    ELSE 'WAITING'
+                    WHEN t.status_pembayaran = 'Belum Lunas' THEN 'WAITING'
+                    ELSE 'FAILED' -- Menambah case Gagal
                 END AS status,
                 t.total_harga_final AS price,
-                (SELECT GROUP_CONCAT(p.nama_produk SEPARATOR ', ')
-                    FROM detail_order_fnb do
-                    JOIN produk_fnb p ON do.id_produk = p.id_produk
-                    WHERE do.id_transaksi = t.id_transaksi
-                ) AS product
+
+                -- Subquery untuk produk F&B (tetap sama)
+                (SELECT GROUP_CONCAT(pf.nama_produk SEPARATOR ', ')
+                    FROM detail_order_fnb dof
+                    JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+                    WHERE dof.id_transaksi = t.id_transaksi
+                ) AS product,
+
+                -- === SUBQUERY BARU UNTUK BOOKING RUANGAN ===
+                (SELECT GROUP_CONCAT(
+                            CONCAT(r.nama_ruangan, ' (', kr.nama_kategori, ')') 
+                            SEPARATOR ', '
+                        )
+                    FROM booking_ruangan br
+                    JOIN ruangan r ON br.id_ruangan = r.id_ruangan
+                    JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan
+                    WHERE br.id_transaksi = t.id_transaksi
+                ) AS booked_rooms
+                -- === AKHIR SUBQUERY BARU ===
+
             FROM transaksi t
             LEFT JOIN users u ON t.id_user = u.id_user
             ORDER BY t.tanggal_transaksi DESC;
         """
+        # === AKHIR PERUBAHAN QUERY ===
 
         cursor.execute(query)
         results = cursor.fetchall()
-        
-        # Mengganti nilai None pada product menjadi string kosong agar tidak error di frontend
+
+        # Mengganti nilai None pada product dan booked_rooms
         for row in results:
             if row['product'] is None:
                 row['product'] = '-'
+            # --- TAMBAHKAN INI ---
+            if row['booked_rooms'] is None:
+                row['booked_rooms'] = '-'
+            # --- AKHIR TAMBAHAN ---
 
         return jsonify({"message": "OK", "datas": results}), 200
 
     except Exception as e:
+        # Sebaiknya log error di sini juga
+        print(f"Error fetching transactions: {e}")
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor:
             cursor.close()
         if connection:
             connection.close()
+
+
+# @kasir_endpoints.route('/transaksi', methods=['GET'])
+# def get_all_transaksi():
+#     """Endpoint untuk mendapatkan daftar transaksi yang sudah diformat."""
+#     connection = None
+#     cursor = None
+#     try:
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
+
+#         # Query ini telah diperbaiki sesuai skema database final kita
+#         query = """
+#             SELECT
+#                 t.id_transaksi AS id,
+#                 COALESCE(u.nama, t.nama_guest) AS name,
+#                 t.lokasi_pemesanan AS type,
+#                 CASE
+#                     WHEN t.status_pembayaran = 'Lunas' THEN 'SUCCESS'
+#                     ELSE 'WAITING'
+#                 END AS status,
+#                 t.total_harga_final AS price,
+#                 (SELECT GROUP_CONCAT(p.nama_produk SEPARATOR ', ')
+#                     FROM detail_order_fnb do
+#                     JOIN produk_fnb p ON do.id_produk = p.id_produk
+#                     WHERE do.id_transaksi = t.id_transaksi
+#                 ) AS product
+#             FROM transaksi t
+#             LEFT JOIN users u ON t.id_user = u.id_user
+#             ORDER BY t.tanggal_transaksi DESC;
+#         """
+
+#         cursor.execute(query)
+#         results = cursor.fetchall()
+
+#         # Mengganti nilai None pada product menjadi string kosong agar tidak error di frontend
+#         for row in results:
+#             if row['product'] is None:
+#                 row['product'] = '-'
+
+#         return jsonify({"message": "OK", "datas": results}), 200
+
+#     except Exception as e:
+#         return jsonify({"message": "ERROR", "error": str(e)}), 500
+#     finally:
+#         if cursor:
+#             cursor.close()
+#         if connection:
+#             connection.close()
+
 
 @kasir_endpoints.route('/transaksi', methods=['POST'])
 def create_transaksi():
@@ -1941,13 +2663,13 @@ def create_transaksi():
         """
         # Harga awal 0, status belum lunas & baru
         values = (customer_name, order_type, 0, 'Belum Lunas', 'Baru')
-        
+
         cursor.execute(query, values)
         new_transaksi_id = cursor.lastrowid
         connection.commit()
 
         return jsonify({
-            "message": "Transaksi baru berhasil dibuat", 
+            "message": "Transaksi baru berhasil dibuat",
             "id_transaksi": new_transaksi_id
         }), 201
 
@@ -2053,9 +2775,8 @@ def read_age(book_id):
     return jsonify({"message": "OK", "datas": results}), 200
 
 
-
 @kasir_endpoints.route('/summary_by_payment', methods=['GET'])
-@jwt_required() # Pastikan hanya admin/owner yang bisa akses jika perlu
+@jwt_required()  # Pastikan hanya admin/owner yang bisa akses jika perlu
 def get_payment_summary_by_date():
     """
     Mengambil ringkasan total pendapatan dan jumlah transaksi
@@ -2096,10 +2817,10 @@ def get_payment_summary_by_date():
         GROUP BY 
             metode_pembayaran;
         """
-        
+
         cursor.execute(query, (target_date_str,))
         results = cursor.fetchall()
-        
+
         # Siapkan struktur data default untuk dikirim ke frontend
         summary = {
             'Tunai': {'jumlah_transaksi': 0, 'total_pendapatan': 0},
@@ -2107,21 +2828,21 @@ def get_payment_summary_by_date():
             'tanggal_laporan': target_date_str,
             'total_keseluruhan': 0
         }
-        
+
         total_all = 0
-        
+
         # Isi data dari hasil query
         for row in results:
             if row['metode_pembayaran'] in summary:
                 # Konversi Decimal ke float agar aman untuk JSON
                 total_pendapatan_float = float(row['total_pendapatan'])
-                
+
                 summary[row['metode_pembayaran']] = {
                     'jumlah_transaksi': row['jumlah_transaksi'],
                     'total_pendapatan': total_pendapatan_float
                 }
                 total_all += total_pendapatan_float
-        
+
         summary['total_keseluruhan'] = total_all
 
         return jsonify({
@@ -2131,7 +2852,7 @@ def get_payment_summary_by_date():
 
     except Exception as e:
         return jsonify({"message": "ERROR", "error": str(e)}), 500
-    
+
     finally:
         if cursor:
             cursor.close()

@@ -8,7 +8,7 @@ from helper.form_validation import get_form_data
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from helper.year_operation import diff_year
 from helper.year_operation import check_age_book
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 import math
 import traceback
 from datetime import datetime # --- PERUBAHAN 1: Impor library datetime ---
@@ -64,6 +64,7 @@ def get_private_office_rooms():
         if cursor: cursor.close()
         if connection: connection.close()
 
+
 @ruangan_endpoints.route('/bookRuanganBulk', methods=['POST'])
 @jwt_required()
 def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
@@ -96,7 +97,9 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
         jam_mulai_int = data.get("jam_mulai")
         jam_selesai_int = data.get("jam_selesai")
         metode_pembayaran = data.get("metode_pembayaran", "Non-Tunai")
-        status_pembayaran = data.get("status_pembayaran", "Belum Lunas")
+        status_pembayaran = data.get("status_pembayaran", "Lunas")
+        
+        booking_source = data.get("booking_source", "PrivateOffice") # Default 'PrivateOffice'
 
         # Validasi Input Dasar
         if not all([room_ids, tanggal_mulai_str, tanggal_selesai_str, isinstance(jam_mulai_int, int), isinstance(jam_selesai_int, int)]):
@@ -188,11 +191,11 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
 
         # --- TAHAP 2: BUAT 1 TRANSAKSI INDUK ---
         insert_transaksi = """
-        INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order, booking_source)
+        VALUES (%s, %s, %s, %s, %s, %s)
         """
         status_order = "Baru"
-        cursor.execute(insert_transaksi, (id_user, int(round(total_harga_transaksi)), metode_pembayaran, status_pembayaran, status_order))
+        cursor.execute(insert_transaksi, (id_user, int(round(total_harga_transaksi)), metode_pembayaran, status_pembayaran, status_order, booking_source))
         id_transaksi_baru = cursor.lastrowid
 
         # --- TAHAP 3: MASUKKAN SEMUA BOOKING HARIAN ---
@@ -231,14 +234,118 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-        
-        
 
 
 
 
 
 
+
+
+@ruangan_endpoints.route('/check-availability-bulk', methods=['POST'])
+def check_availability_bulk():
+    """
+    Memeriksa ketersediaan untuk BANYAK ruangan pada rentang tanggal dan jam tertentu.
+    Mengembalikan daftar slot yang TIDAK TERSEDIA.
+    """
+    connection = None
+    cursor = None
+    try:
+        data = request.json
+        room_ids = data.get("room_ids") # Array of integer IDs
+        tanggal_mulai_str = data.get("tanggal_mulai") # "YYYY-MM-DD"
+        tanggal_selesai_str = data.get("tanggal_selesai") # "YYYY-MM-DD"
+        jam_mulai_int = data.get("jam_mulai") # Integer hour (0-23)
+        jam_selesai_int = data.get("jam_selesai") # Integer hour (0-23)
+
+        # --- Validasi Input Dasar (mirip /bookRuanganBulk) ---
+        if not all([room_ids, tanggal_mulai_str, tanggal_selesai_str, isinstance(jam_mulai_int, int), isinstance(jam_selesai_int, int)]):
+            return jsonify({"message": "ERROR", "error": "Data input tidak lengkap atau format jam salah."}), 400
+        if jam_selesai_int <= jam_mulai_int:
+             return jsonify({"message": "ERROR", "error": "Jam selesai harus setelah jam mulai."}), 400
+        if not isinstance(room_ids, list) or not all(isinstance(rid, int) for rid in room_ids):
+             return jsonify({"message": "ERROR", "error": "room_ids harus berupa array integer."}), 400
+
+        try:
+            tanggal_mulai_date = datetime.strptime(tanggal_mulai_str, "%Y-%m-%d").date()
+            tanggal_selesai_date = datetime.strptime(tanggal_selesai_str, "%Y-%m-%d").date()
+            if tanggal_selesai_date < tanggal_mulai_date:
+                raise ValueError("Tanggal selesai tidak boleh sebelum tanggal mulai.")
+        except ValueError as e:
+             return jsonify({"message": "ERROR", "error": f"Format tanggal salah: {e}"}), 400
+        # --- End Validasi Input Dasar ---
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        unavailable_slots = []
+        placeholders = ','.join(['%s'] * len(room_ids))
+
+        # Ambil nama ruangan sekali saja untuk pesan error yang lebih baik
+        cursor.execute(f"SELECT id_ruangan, nama_ruangan FROM ruangan WHERE id_ruangan IN ({placeholders})", tuple(room_ids))
+        room_names = {room['id_ruangan']: room['nama_ruangan'] for room in cursor.fetchall()}
+
+        current_date_check = tanggal_mulai_date
+        while current_date_check <= tanggal_selesai_date:
+            waktu_mulai_dt = datetime.combine(current_date_check, time(jam_mulai_int))
+            waktu_selesai_dt = datetime.combine(current_date_check, time(jam_selesai_int))
+
+            # Penyesuaian jika melintasi tengah malam (sama seperti di booking)
+            if waktu_selesai_dt <= waktu_mulai_dt:
+                 waktu_selesai_dt += timedelta(days=1)
+                 if tanggal_selesai_date == tanggal_mulai_date and len(room_ids) * (tanggal_selesai_date - tanggal_mulai_date + timedelta(days=1)).days == 1 :
+                      raise ValueError("Untuk booking satu hari, jam selesai harus setelah jam mulai di hari yang sama.")
+                 elif current_date_check == tanggal_selesai_date:
+                      waktu_selesai_dt -= timedelta(days=1)
+
+            waktu_mulai_db_str = waktu_mulai_dt.strftime('%Y-%m-%d %H:%M:%S')
+            waktu_selesai_db_str = waktu_selesai_dt.strftime('%Y-%m-%d %H:%M:%S')
+
+            # Query untuk cek konflik PADA HARI INI untuk SEMUA ruangan yang diminta
+            check_query = f"""
+                SELECT id_ruangan
+                FROM booking_ruangan
+                WHERE id_ruangan IN ({placeholders})
+                  AND waktu_mulai < %s
+                  AND waktu_selesai > %s
+            """
+            # Parameter: room_ids tuple, waktu_selesai_db_str, waktu_mulai_db_str
+            params = tuple(room_ids) + (waktu_selesai_db_str, waktu_mulai_db_str)
+            cursor.execute(check_query, params)
+            conflicts = cursor.fetchall()
+
+            if conflicts:
+                for conflict in conflicts:
+                    room_id = conflict['id_ruangan']
+                    unavailable_slots.append({
+                        "room_id": room_id,
+                        "nama_ruangan": room_names.get(room_id, f"ID {room_id}"),
+                        "tanggal": current_date_check.strftime('%Y-%m-%d'),
+                        "jam_mulai": jam_mulai_int,
+                        "jam_selesai": jam_selesai_int,
+                        "message": f"{room_names.get(room_id, f'Ruangan ID {room_id}')} tidak tersedia pada {current_date_check.strftime('%d-%m-%Y')} jam {jam_mulai_int}:00 - {jam_selesai_int}:00"
+                    })
+
+            current_date_check += timedelta(days=1) # Pindah ke hari berikutnya
+
+        # Jika tidak ada konflik, unavailable_slots akan kosong
+        return jsonify({
+            "message": "OK",
+            "available": len(unavailable_slots) == 0,
+            "unavailable_slots": unavailable_slots
+        }), 200
+
+    except ValueError as ve: # Tangkap error validasi format/logika
+        print(f"Validation Error check availability: {ve}")
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(ve)}), 400
+    except Exception as e:
+        print(f"Error pada /check-availability-bulk: {e}")
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal saat memeriksa ketersediaan."}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()
 
 
 
@@ -1327,6 +1434,8 @@ def book_ruangan():
         credit_cost = data.get("creditCost", 0)
         virtual_office_id = data.get("virtualOfficeId")
         benefit_cost = data.get("benefitCost", 0) # Total jam benefit yg akan dipakai
+        
+        booking_source = data.get("booking_source", "RoomDetail") # Default 'RoomDetail'
 
         # --- Konversi & Kalkulasi Awal ---
         tanggal_mulai = datetime.strptime(tanggal_mulai_str, "%Y-%m-%d").date()
@@ -1383,8 +1492,8 @@ def book_ruangan():
             metode_pembayaran_db = "Virtual Office Benefit"
 
         # 2. Buat satu record transaksi
-        insert_transaksi = "INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order, lokasi_pemesanan) VALUES (%s, %s, %s, 'Lunas', 'Baru', %s)"
-        cursor.execute(insert_transaksi, (id_user, harga_transaksi, metode_pembayaran_db, f"ruangan_{id_ruangan}"))
+        insert_transaksi = "INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order, lokasi_pemesanan, booking_source) VALUES (%s, %s, %s, 'Lunas', 'Baru', %s, %s)"
+        cursor.execute(insert_transaksi, (id_user, harga_transaksi, metode_pembayaran_db, f"ruangan_{id_ruangan}", booking_source))
         id_transaksi = cursor.lastrowid
         
         # 3. Proses pengurangan (jika ada)

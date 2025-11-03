@@ -8,15 +8,12 @@ from flask_jwt_extended import jwt_required
 from helper.year_operation import diff_year
 from helper.year_operation import check_age_book
 from werkzeug.utils import secure_filename
-from datetime import datetime, timedelta
 import traceback
 from datetime import datetime, date, timedelta
 from mysql.connector import Error as DbError
 import traceback
 import io
 import csv
-import datetime
-
 
 
 admin_endpoints = Blueprint("admin_endpoints", __name__)
@@ -24,6 +21,300 @@ admin_endpoints = Blueprint("admin_endpoints", __name__)
 # folder penyimpanan upload
 UPLOAD_FOLDER = "img"
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
+
+
+
+# Helper untuk JSON
+# Helper untuk JSON
+def decimal_default(obj):
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+    raise TypeError
+
+# === 1. ENDPOINT UTAMA (BARU): Laporan Live Berdasarkan Rentang Tanggal ===
+@admin_endpoints.route('/rekap-live', methods=['GET'])
+def get_rekap_live():
+    connection = None
+    try:
+        # Ambil start_date dan end_date dari query params
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
+
+        if not start_date_str or not end_date_str:
+            return jsonify({"message": "ERROR", "error": "Parameter 'start_date' dan 'end_date' diperlukan (format YYYY-MM-DD)"}), 400
+
+        # Tambahkan ' 23:59:59' ke end_date agar mencakup HARI ITU
+        end_date_str_inclusive = f"{end_date_str} 23:59:59"
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. Ambil semua tenant aktif
+        cursor.execute("SELECT id_tenant, nama_tenant FROM tenants WHERE status_tenant = 'Active' ORDER BY nama_tenant")
+        tenants = cursor.fetchall()
+
+        rekap_data = []
+
+        for tenant in tenants:
+            id_tenant = tenant['id_tenant']
+            
+            # 2. Hitung Total Sales dalam rentang tanggal
+            query_sales = """
+                SELECT COALESCE(SUM(dof.harga_saat_order * dof.jumlah), 0) AS total
+                FROM transaksi t
+                JOIN detail_order_fnb dof ON t.id_transaksi = dof.id_transaksi
+                JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+                JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
+                WHERE kp.id_tenant = %s
+                  AND t.status_pembayaran = 'Lunas'
+                  AND t.tanggal_transaksi BETWEEN %s AND %s;
+            """
+            cursor.execute(query_sales, (id_tenant, start_date_str, end_date_str_inclusive))
+            total_sales = cursor.fetchone()['total']
+
+            # 3. Hitung Utang Awal (Semua utang belum lunas SEBELUM start_date)
+            query_utang_awal = """
+                SELECT COALESCE(SUM(jumlah), 0) AS total
+                FROM utang_tenant
+                WHERE id_tenant = %s
+                  AND status_lunas = 0
+                  AND tanggal_utang < %s;
+            """
+            cursor.execute(query_utang_awal, (id_tenant, start_date_str))
+            utang_awal = cursor.fetchone()['total']
+
+            # 4. Hitung Utang Baru (Utang yang ditambahkan SELAMA rentang tanggal)
+            query_utang_baru = """
+                SELECT COALESCE(SUM(jumlah), 0) AS total
+                FROM utang_tenant
+                WHERE id_tenant = %s
+                  AND status_lunas = 0
+                  AND tanggal_utang BETWEEN %s AND %s;
+            """
+            cursor.execute(query_utang_baru, (id_tenant, start_date_str, end_date_str))
+            utang_masuk_periode = cursor.fetchone()['total']
+
+            # 5. (PENTING) Hitung pelunasan utang yang terjadi SELAMA rentang tanggal
+            # Asumsi: 'utang_awal' di rekap_bagi_hasil adalah jumlah yg dipotong
+            query_pelunasan = """
+                SELECT COALESCE(SUM(utang_awal), 0) AS total
+                FROM rekap_bagi_hasil
+                WHERE id_tenant = %s
+                  AND status_pembayaran_t1 = 1 -- (Kita anggap T1 = Lunas)
+                  AND MAKEDATE(periode_tahun, 1) + INTERVAL (periode_bulan - 1) MONTH 
+                      BETWEEN %s AND %s; 
+            """
+            # Ini asumsi kasar, logika pelunasan mungkin perlu disesuaikan
+            # Untuk SAAT INI, kita anggap pelunasan = 0 agar sederhana
+            pelunasan_periode = 0
+            
+            # Total Utang = Utang Awal + Utang Baru - Pelunasan
+            total_utang = utang_awal + utang_masuk_periode - pelunasan_periode
+
+            rekap_data.append({
+                "id_tenant": id_tenant,
+                "nama_tenant": tenant['nama_tenant'],
+                "totalSales": total_sales,
+                "utangAwal": utang_awal,
+                "utangMasukPeriode": utang_masuk_periode,
+                "totalUtang": total_utang # Utang Awal + Utang Baru
+            })
+
+        return jsonify({"message": "OK", "datas": rekap_data}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if connection:
+            connection.close()
+
+# === 2. Endpoint: Menambah Utang Ad-hoc (Form "Input Utang") ===
+# Endpoint ini sudah benar, hanya perlu memastikan 'tanggal_utang' diterima
+@admin_endpoints.route('/utang-tenant', methods=['POST'])
+def add_utang_tenant():
+    connection = None
+    try:
+        data = request.json
+        id_tenant = data.get('id_tenant')
+        jumlah = data.get('jumlah')
+        deskripsi = data.get('deskripsi', 'Utang manual dari admin')
+        tanggal_utang = data.get('tanggal_utang') # 'YYYY-MM-DD'
+
+        if not id_tenant or not jumlah or not tanggal_utang:
+            return jsonify({"message": "ERROR", "error": "id_tenant, jumlah, dan tanggal_utang diperlukan"}), 400
+
+        connection = get_connection()
+        cursor = connection.cursor()
+        
+        query = """
+            INSERT INTO utang_tenant (id_tenant, tanggal_utang, jumlah, deskripsi, status_lunas)
+            VALUES (%s, %s, %s, %s, 0)
+        """
+        cursor.execute(query, (id_tenant, tanggal_utang, jumlah, deskripsi))
+        connection.commit()
+
+        return jsonify({"message": "Utang tenant berhasil ditambahkan"}), 201
+
+    except Exception as e:
+        if connection: connection.rollback()
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if connection:
+            connection.close()
+
+# === 3. Endpoint: Mengambil Daftar Tenant Aktif (Tetap sama) ===
+@admin_endpoints.route('/tenants-active', methods=['GET'])
+def get_active_tenants():
+    # ... (Endpoint ini tidak berubah, sudah benar) ...
+    connection = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT id_tenant, nama_tenant FROM tenants WHERE status_tenant = 'Active' ORDER BY nama_tenant")
+        tenants = cursor.fetchall()
+        return jsonify({"message": "OK", "datas": tenants}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if connection:
+            connection.close()
+
+@admin_endpoints.route('/utang-log', methods=['GET'])
+def get_utang_log():
+    connection = None
+    try:
+        # Ambil parameter dari query URL
+        tenant_id = request.args.get('tenant_id', type=int)
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
+
+        if not tenant_id:
+            return jsonify({"message": "ERROR", "error": "Parameter 'tenant_id' diperlukan"}), 400
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # Query dasar untuk semua utang tenant
+        query = """
+            SELECT id_utang, id_tenant, tanggal_utang, jumlah, deskripsi, status_lunas
+            FROM utang_tenant
+            WHERE id_tenant = %s
+        """
+        params = [tenant_id]
+
+        # Tambahkan filter tanggal jika ada
+        if start_date_str and end_date_str:
+            query += " AND tanggal_utang BETWEEN %s AND %s"
+            params.extend([start_date_str, end_date_str])
+        
+        query += " ORDER BY tanggal_utang DESC"
+        
+        cursor.execute(query, tuple(params))
+        utang_log = cursor.fetchall()
+
+        # Konversi Decimal ke float/str untuk JSON
+        for log in utang_log:
+            log['jumlah'] = float(log['jumlah'])
+            # Ubah tanggal ke format YYYY-MM-DD
+            if isinstance(log['tanggal_utang'], datetime):
+                log['tanggal_utang'] = log['tanggal_utang'].strftime('%Y-%m-%d')
+            elif isinstance(log['tanggal_utang'], date): # Handle jika tipenya date
+                 log['tanggal_utang'] = log['tanggal_utang'].strftime('%Y-%m-%d')
+
+
+        return jsonify({"message": "OK", "datas": utang_log}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if connection:
+            connection.close()
+
+# === 8. (BARU) UPDATE Entri Utang (Modal Edit) ===
+@admin_endpoints.route('/utang-log/<int:id_utang>', methods=['PUT'])
+def update_utang_entry(id_utang):
+    connection = None
+    try:
+        data = request.json
+        jumlah = data.get('jumlah')
+        deskripsi = data.get('deskripsi')
+        tanggal_utang = data.get('tanggal_utang') # 'YYYY-MM-DD'
+        status_lunas = data.get('status_lunas') # boolean
+
+        if not all([jumlah, deskripsi, tanggal_utang, status_lunas is not None]):
+            return jsonify({"message": "ERROR", "error": "Semua field (jumlah, deskripsi, tanggal_utang, status_lunas) diperlukan"}), 400
+
+        connection = get_connection()
+        cursor = connection.cursor()
+        
+        query = """
+            UPDATE utang_tenant
+            SET tanggal_utang = %s,
+                jumlah = %s,
+                deskripsi = %s,
+                status_lunas = %s
+            WHERE id_utang = %s
+        """
+        params = (tanggal_utang, decimal.Decimal(jumlah), deskripsi, 1 if status_lunas else 0, id_utang)
+        
+        cursor.execute(query, params)
+        if cursor.rowcount == 0:
+            return jsonify({"message": "ERROR", "error": "ID Utang tidak ditemukan"}), 404
+
+        connection.commit()
+        return jsonify({"message": "Entri utang berhasil diperbarui"}), 200
+
+    except Exception as e:
+        if connection: connection.rollback()
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if connection:
+            connection.close()
+
+# === 9. (BARU) DELETE Entri Utang (Tombol Hapus) ===
+@admin_endpoints.route('/utang-log/<int:id_utang>', methods=['DELETE'])
+def delete_utang_entry(id_utang):
+    connection = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+        
+        query = "DELETE FROM utang_tenant WHERE id_utang = %s"
+        cursor.execute(query, (id_utang,))
+        
+        if cursor.rowcount == 0:
+            return jsonify({"message": "ERROR", "error": "ID Utang tidak ditemukan"}), 404
+
+        connection.commit()
+        return jsonify({"message": "Entri utang berhasil dihapus"}), 200
+
+    except Exception as e:
+        if connection: connection.rollback()
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if connection:
+            connection.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # pastikan folder ada
 if not os.path.exists(UPLOAD_FOLDER):
@@ -75,114 +366,114 @@ def generate_csv_response(headers, data, filename="export.csv"):
 
 # --- ENDPOINT UTAMA ---
 
-@admin_endpoints.route('/rekap-bagi-hasil', methods=['GET'])
-def get_rekap_bagi_hasil():
-    """
-    Endpoint utama. Mengambil data rekap bulanan yang sudah dikalkulasi.
-    Menerima query params: tahun, bulan, p1_start, p1_end, p2_start, p2_end
-    """
-    connection = None
-    cursor = None
-    try:
-        # 1. Ambil Query Params
-        tahun = request.args.get('tahun', type=int)
-        bulan = request.args.get('bulan', type=int)
-        p1_start = request.args.get('p1_start')
-        p1_end = request.args.get('p1_end')
-        p2_start = request.args.get('p2_start')
-        p2_end = request.args.get('p2_end')
+# @admin_endpoints.route('/rekap-bagi-hasil', methods=['GET'])
+# def get_rekap_bagi_hasil():
+#     """
+#     Endpoint utama. Mengambil data rekap bulanan yang sudah dikalkulasi.
+#     Menerima query params: tahun, bulan, p1_start, p1_end, p2_start, p2_end
+#     """
+#     connection = None
+#     cursor = None
+#     try:
+#         # 1. Ambil Query Params
+#         tahun = request.args.get('tahun', type=int)
+#         bulan = request.args.get('bulan', type=int)
+#         p1_start = request.args.get('p1_start')
+#         p1_end = request.args.get('p1_end')
+#         p2_start = request.args.get('p2_start')
+#         p2_end = request.args.get('p2_end')
 
-        if not all([tahun, bulan, p1_start, p1_end, p2_start, p2_end]):
-            return jsonify({"error": "Parameter tidak lengkap."}), 400
+#         if not all([tahun, bulan, p1_start, p1_end, p2_start, p2_end]):
+#             return jsonify({"error": "Parameter tidak lengkap."}), 400
 
-        connection = get_connection()
-        cursor = connection.cursor(dictionary=True)
+#         connection = get_connection()
+#         cursor = connection.cursor(dictionary=True)
 
-        # 2. Get semua tenant aktif
-        cursor.execute("SELECT id_tenant, nama_tenant FROM tenants WHERE status_tenant = 'Active'")
-        tenants = cursor.fetchall()
+#         # 2. Get semua tenant aktif
+#         cursor.execute("SELECT id_tenant, nama_tenant FROM tenants WHERE status_tenant = 'Active'")
+#         tenants = cursor.fetchall()
         
-        response_data = []
+#         response_data = []
 
-        # 3. Loop per tenant untuk kalkulasi data
-        for tenant in tenants:
-            id_tenant = tenant['id_tenant']
+#         # 3. Loop per tenant untuk kalkulasi data
+#         for tenant in tenants:
+#             id_tenant = tenant['id_tenant']
             
-            # 3a. Kalkulasi Sales P1 & P2 dari Transaksi
-            sales_p1_calc = calculate_tenant_sales(cursor, id_tenant, p1_start, p1_end)
-            sales_p2_calc = calculate_tenant_sales(cursor, id_tenant, p2_start, p2_end)
+#             # 3a. Kalkulasi Sales P1 & P2 dari Transaksi
+#             sales_p1_calc = calculate_tenant_sales(cursor, id_tenant, p1_start, p1_end)
+#             sales_p2_calc = calculate_tenant_sales(cursor, id_tenant, p2_start, p2_end)
 
-            # 3b. Get data rekap dari DB (utang_awal dan override sales)
-            cursor.execute(
-                """
-                SELECT utang_awal, sales_p1, sales_p2 
-                FROM rekap_bagi_hasil 
-                WHERE id_tenant = %s AND periode_tahun = %s AND periode_bulan = %s
-                """,
-                (id_tenant, tahun, bulan)
-            )
-            rekap = cursor.fetchone()
+#             # 3b. Get data rekap dari DB (utang_awal dan override sales)
+#             cursor.execute(
+#                 """
+#                 SELECT utang_awal, sales_p1, sales_p2 
+#                 FROM rekap_bagi_hasil 
+#                 WHERE id_tenant = %s AND periode_tahun = %s AND periode_bulan = %s
+#                 """,
+#                 (id_tenant, tahun, bulan)
+#             )
+#             rekap = cursor.fetchone()
 
-            utang_awal_db = 0
-            sales_p1_override = None
-            sales_p2_override = None
+#             utang_awal_db = 0
+#             sales_p1_override = None
+#             sales_p2_override = None
 
-            if rekap:
-                utang_awal_db = rekap['utang_awal'] or 0
-                sales_p1_override = rekap['sales_p1']
-                sales_p2_override = rekap['sales_p2']
+#             if rekap:
+#                 utang_awal_db = rekap['utang_awal'] or 0
+#                 sales_p1_override = rekap['sales_p1']
+#                 sales_p2_override = rekap['sales_p2']
 
-            # 3c. Get riwayat utang baru (debtHistory) di bulan berjalan
-            cursor.execute(
-                """
-                SELECT id_utang, tanggal_utang, jumlah, deskripsi, status_lunas
-                FROM utang_tenant 
-                WHERE id_tenant = %s 
-                  AND YEAR(tanggal_utang) = %s 
-                  AND MONTH(tanggal_utang) = %s
-                  AND status_lunas = 0
-                """, 
-                (id_tenant, tahun, bulan)
-            )
-            utang_history_db = cursor.fetchall()
+#             # 3c. Get riwayat utang baru (debtHistory) di bulan berjalan
+#             cursor.execute(
+#                 """
+#                 SELECT id_utang, tanggal_utang, jumlah, deskripsi, status_lunas
+#                 FROM utang_tenant 
+#                 WHERE id_tenant = %s 
+#                   AND YEAR(tanggal_utang) = %s 
+#                   AND MONTH(tanggal_utang) = %s
+#                   AND status_lunas = 0
+#                 """, 
+#                 (id_tenant, tahun, bulan)
+#             )
+#             utang_history_db = cursor.fetchall()
             
-            # Konversi data utang ke format yang disukai frontend
-            debt_history_frontend = [
-                {
-                    "id": u['id_utang'],
-                    "date": u['tanggal_utang'].isoformat(), # Kirim sebagai ISO string
-                    "amount": float(u['jumlah']),
-                    "isPaidOut": bool(u['status_lunas'])
-                    # 'paymentPeriod' akan ditentukan oleh frontend
-                } for u in utang_history_db
-            ]
+#             # Konversi data utang ke format yang disukai frontend
+#             debt_history_frontend = [
+#                 {
+#                     "id": u['id_utang'],
+#                     "date": u['tanggal_utang'].isoformat(), # Kirim sebagai ISO string
+#                     "amount": float(u['jumlah']),
+#                     "isPaidOut": bool(u['status_lunas'])
+#                     # 'paymentPeriod' akan ditentukan oleh frontend
+#                 } for u in utang_history_db
+#             ]
 
-            # 4. Susun data
-            tenant_data = {
-                "id": id_tenant,
-                "name": tenant['nama_tenant'],
-                "totalSales": {
-                    # Gunakan override JIKA ADA, jika tidak (NULL), gunakan hasil kalkulasi
-                    "p1": float(sales_p1_override if sales_p1_override is not None else sales_p1_calc),
-                    "p2": float(sales_p2_override if sales_p2_override is not None else sales_p2_calc)
-                },
-                "currentDebt": float(utang_awal_db),
-                "debtHistory": debt_history_frontend
-            }
-            response_data.append(tenant_data)
+#             # 4. Susun data
+#             tenant_data = {
+#                 "id": id_tenant,
+#                 "name": tenant['nama_tenant'],
+#                 "totalSales": {
+#                     # Gunakan override JIKA ADA, jika tidak (NULL), gunakan hasil kalkulasi
+#                     "p1": float(sales_p1_override if sales_p1_override is not None else sales_p1_calc),
+#                     "p2": float(sales_p2_override if sales_p2_override is not None else sales_p2_calc)
+#                 },
+#                 "currentDebt": float(utang_awal_db),
+#                 "debtHistory": debt_history_frontend
+#             }
+#             response_data.append(tenant_data)
 
-        return jsonify(response_data), 200
+#         return jsonify(response_data), 200
 
-    except DbError as db_err:
-        print(f"Database error in get_rekap_bagi_hasil: {db_err}")
-        return jsonify({"error": "Database error"}), 500
-    except Exception as e:
-        print(f"General error in get_rekap_bagi_hasil: {e}")
-        traceback.print_exc()
-        return jsonify({"error": "Internal server error"}), 500
-    finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
+#     except DbError as db_err:
+#         print(f"Database error in get_rekap_bagi_hasil: {db_err}")
+#         return jsonify({"error": "Database error"}), 500
+#     except Exception as e:
+#         print(f"General error in get_rekap_bagi_hasil: {e}")
+#         traceback.print_exc()
+#         return jsonify({"error": "Internal server error"}), 500
+#     finally:
+#         if cursor: cursor.close()
+#         if connection: connection.close()
 
 @admin_endpoints.route('/rekap-bagi-hasil/update', methods=['PUT'])
 def update_rekap_data():
@@ -235,49 +526,49 @@ def update_rekap_data():
         if connection: connection.close()
 
 
-@admin_endpoints.route('/utang-tenant', methods=['POST'])
-def add_utang_tenant():
-    """Menambah catatan utang/kasbon baru."""
-    connection = None
-    cursor = None
-    try:
-        data = request.get_json()
-        id_tenant = data.get('id_tenant')
-        tanggal_utang = data.get('date') # Harusnya format YYYY-MM-DD
-        jumlah = data.get('amount')
+# @admin_endpoints.route('/utang-tenant', methods=['POST'])
+# def add_utang_tenant():
+#     """Menambah catatan utang/kasbon baru."""
+#     connection = None
+#     cursor = None
+#     try:
+#         data = request.get_json()
+#         id_tenant = data.get('id_tenant')
+#         tanggal_utang = data.get('date') # Harusnya format YYYY-MM-DD
+#         jumlah = data.get('amount')
 
-        if not all([id_tenant, tanggal_utang, jumlah]):
-             return jsonify({"error": "Data utang tidak lengkap"}), 400
+#         if not all([id_tenant, tanggal_utang, jumlah]):
+#              return jsonify({"error": "Data utang tidak lengkap"}), 400
 
-        connection = get_connection()
-        cursor = connection.cursor()
+#         connection = get_connection()
+#         cursor = connection.cursor()
         
-        query = "INSERT INTO utang_tenant (id_tenant, tanggal_utang, jumlah) VALUES (%s, %s, %s)"
-        cursor.execute(query, (id_tenant, tanggal_utang, jumlah))
-        new_id = cursor.lastrowid
-        connection.commit()
+#         query = "INSERT INTO utang_tenant (id_tenant, tanggal_utang, jumlah) VALUES (%s, %s, %s)"
+#         cursor.execute(query, (id_tenant, tanggal_utang, jumlah))
+#         new_id = cursor.lastrowid
+#         connection.commit()
         
-        # Kembalikan data utang yang baru dibuat
-        return jsonify({
-            "message": "OK", 
-            "info": "Utang baru berhasil ditambahkan",
-            "newDebt": {
-                "id": new_id,
-                "date": tanggal_utang,
-                "amount": float(jumlah),
-                "isPaidOut": False
-            }
-        }), 201
+#         # Kembalikan data utang yang baru dibuat
+#         return jsonify({
+#             "message": "OK", 
+#             "info": "Utang baru berhasil ditambahkan",
+#             "newDebt": {
+#                 "id": new_id,
+#                 "date": tanggal_utang,
+#                 "amount": float(jumlah),
+#                 "isPaidOut": False
+#             }
+#         }), 201
 
-    except DbError as db_err:
-        if connection: connection.rollback()
-        return jsonify({"error": f"Database error: {db_err}"}), 500
-    except Exception as e:
-        if connection: connection.rollback()
-        return jsonify({"error": f"Internal server error: {e}"}), 500
-    finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
+#     except DbError as db_err:
+#         if connection: connection.rollback()
+#         return jsonify({"error": f"Database error: {db_err}"}), 500
+#     except Exception as e:
+#         if connection: connection.rollback()
+#         return jsonify({"error": f"Internal server error: {e}"}), 500
+#     finally:
+#         if cursor: cursor.close()
+#         if connection: connection.close()
 
 
 @admin_endpoints.route('/utang-tenant/<int:id_utang>', methods=['DELETE'])
@@ -1471,172 +1762,199 @@ def get_laporan_bagi_hasil():
         if cursor: cursor.close()
         if connection: connection.close()
 
-
+# ------------------- WS DASHBOARD (sesuai brief) -------------------
+# --- WS Dashboard: sesuai DB (durasi dari paket_harga_ruangan, daily=1..N) ---
 @admin_endpoints.route('/ws-dashboard-data', methods=['GET'])
-def get_ws_dashboard_data():
+def ws_dashboard_data():
     """
-    Mengambil semua data agregat khusus untuk dasbor Working Space
-    berdasarkan rentang tanggal. (VERSI PERBAIKAN)
+    Data untuk Working Space Dashboard:
+    - stats: totalRevenue, totalBookings, totalVisitors
+    - dailyRevenue: labels -> ['1','2',...,'N'] (hari dalam range, berurutan TANPA loncat)
+                    labelsPretty -> ['1 Okt','2 Okt', ...] untuk tooltip
+                    datasets -> jumlah booking per kategori/hari
+    - categoryContribution: [{name, value}] (revenue per kategori)
+    - packageByDuration: sumbu-X = DISTINCT paket_harga_ruangan.durasi_jam (saja),
+                         hitung booking yang MATCH paket pada RUANGAN yang sama
+                         -> [{durasi_jam, total_booking, total_user, total_revenue}]
+    - topSpaces: Top 10 ruang urut qty booking DESC, tie-break total DESC
     """
-    connection = None
-    cursor = None
+    conn = None
+    cur = None
     try:
+        # default ke bulan berjalan
         today = date.today()
         start_date_str = request.args.get('startDate', today.replace(day=1).strftime('%Y-%m-%d'))
-        end_date_str = request.args.get('endDate', today.strftime('%Y-%m-%d'))
-        
+        end_date_str   = request.args.get('endDate',   today.strftime('%Y-%m-%d'))
+
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        end_date   = datetime.strptime(end_date_str,   '%Y-%m-%d').date()
+        if end_date < start_date:
+            return jsonify({"message": "ERROR", "error": "endDate < startDate"}), 400
 
-        connection = get_connection()
-        cursor = connection.cursor(dictionary=True)
-        
-        # 1. Statistik Utama (Total Revenue, Bookings, Visitors)
-        # PERBAIKAN: Menggunakan COALESCE untuk menggabungkan nama_guest dan id_user
-        query_stats = """
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
+        # ---------- 1) STATS ----------
+        cur.execute("""
             SELECT
-                COALESCE(SUM(t.total_harga_final), 0) AS totalRevenue,
-                COUNT(br.id_booking) AS totalBookings,
-                COUNT(DISTINCT COALESCE(t.nama_guest, CAST(t.id_user AS CHAR))) AS totalVisitors 
+              COALESCE(SUM(t.total_harga_final), 0)                           AS totalRevenue,
+              COUNT(br.id_booking)                                            AS totalBookings,
+              COUNT(DISTINCT COALESCE(t.nama_guest, CAST(t.id_user AS CHAR))) AS totalVisitors
             FROM booking_ruangan br
-            JOIN transaksi t ON br.id_transaksi = t.id_transaksi
-            WHERE t.status_pembayaran = 'Lunas' 
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s -- PERBAIKAN: Filter berdasarkan tanggal booking, bukan transaksi
-        """
-        cursor.execute(query_stats, (start_date_str, end_date_str))
-        stats = cursor.fetchone()
-        
-        # PERBAIKAN: Konversi semua hasil ke integer untuk menghindari error tipe data di JS
-        stats['totalRevenue'] = int(stats['totalRevenue'])
-        stats['totalBookings'] = int(stats['totalBookings'])
-        stats['totalVisitors'] = int(stats['totalVisitors'])
-
-        # 2. Daily Revenue per Kategori (Line Chart)
-        query_daily_revenue = """
-            SELECT
-                DATE_FORMAT(br.waktu_mulai, '%Y-%m-%d') AS period, -- PERBAIKAN: Pakai tanggal booking
-                kr.nama_kategori AS category,
-                SUM(t.total_harga_final) AS total
-            FROM transaksi t
-            JOIN booking_ruangan br ON t.id_transaksi = br.id_transaksi
-            JOIN ruangan r ON br.id_ruangan = r.id_ruangan
-            JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan
-            WHERE t.status_pembayaran = 'Lunas' 
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s -- PERBAIKAN: Filter berdasarkan tanggal booking
-            GROUP BY period, category
-            ORDER BY period ASC;
-        """
-        cursor.execute(query_daily_revenue, (start_date_str, end_date_str))
-        daily_revenue_rows = cursor.fetchall()
-        
-        delta = end_date - start_date
-        all_dates = [(start_date + timedelta(days=i)) for i in range(delta.days + 1)]
-        daily_labels = [d.strftime('%a, %d %b') for d in all_dates]
-        
-        categories = ["Open Space", "Space Monitor", "Room Meeting Besar", "Room Meeting Kecil"]
-        daily_revenue_data = {cat: [0] * len(all_dates) for cat in categories}
-        date_map = {d.strftime('%Y-%m-%d'): i for i, d in enumerate(all_dates)}
-
-        for row in daily_revenue_rows:
-            day_str = row['period']
-            category = row['category']
-            if day_str in date_map and category in daily_revenue_data:
-                idx = date_map[day_str]
-                daily_revenue_data[category][idx] = int(row['total']) # Konversi ke int
-
-        daily_revenue = {"labels": daily_labels, "datasets": daily_revenue_data}
-
-        # 3. Revenue Contribution per Kategori (Doughnut Chart)
-        query_category_contribution = """
-            SELECT
-                kr.nama_kategori AS name,
-                SUM(t.total_harga_final) AS value
-            FROM transaksi t
-            JOIN booking_ruangan br ON t.id_transaksi = br.id_transaksi
-            JOIN ruangan r ON br.id_ruangan = r.id_ruangan
-            JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan
-            WHERE t.status_pembayaran = 'Lunas' 
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s -- PERBAIKAN: Filter berdasarkan tanggal booking
-            GROUP BY name;
-        """
-        cursor.execute(query_category_contribution, (start_date_str, end_date_str))
-        category_contribution = cursor.fetchall()
-        
-        # PERBAIKAN: Konversi 'value' ke integer
-        for item in category_contribution:
-            item['value'] = int(item['value'])
-
-        # 4. Hourly Traffic & Peak Hours (Bar Charts)
-        # PERBAIKAN: Query diubah total untuk memfilter berdasarkan booking aktif
-        query_hourly = """
-            WITH RECURSIVE hours AS (
-                SELECT 8 AS hour
-                UNION ALL
-                SELECT hour + 1 FROM hours WHERE hour < 22
-            )
-            SELECT
-                h.hour,
-                COUNT(paid_bookings.id_booking) AS active_bookings
-            FROM hours h
-            LEFT JOIN (
-                SELECT br.id_booking, br.waktu_mulai, br.waktu_selesai
-                FROM booking_ruangan br
-                JOIN transaksi t ON br.id_transaksi = t.id_transaksi
-                WHERE t.status_pembayaran = 'Lunas'
-                AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-            ) AS paid_bookings
-            ON h.hour >= HOUR(paid_bookings.waktu_mulai) AND h.hour < HOUR(paid_bookings.waktu_selesai)
-            GROUP BY h.hour
-            ORDER BY h.hour;
-        """
-        cursor.execute(query_hourly, (start_date_str, end_date_str))
-        hourly_rows = cursor.fetchall()
-        hourly_traffic = {
-            "labels": [f"{h['hour']:02d}" for h in hourly_rows],
-            "data": [int(h['active_bookings']) for h in hourly_rows] # Konversi ke int
+            JOIN transaksi t ON t.id_transaksi = br.id_transaksi
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+        """, (start_date_str, end_date_str))
+        s = cur.fetchone() or {}
+        stats = {
+            "totalRevenue": int(s.get("totalRevenue") or 0),
+            "totalBookings": int(s.get("totalBookings") or 0),
+            "totalVisitors": int(s.get("totalVisitors") or 0),
         }
 
-        # 5. Top 10 Working Spaces (Tabel)
-        query_top_spaces = """
+        # ---------- 2) DAILY BOOKING (labels = hari 1..N) ----------
+        days_count = (end_date - start_date).days + 1
+        all_dates = [start_date + timedelta(days=i) for i in range(days_count)]
+        pos_map = {(start_date + timedelta(days=i)).strftime('%Y-%m-%d'): i for i in range(days_count)}
+
+        labels_days   = [str(d.day) for d in all_dates]  # "1".."N"
+        # Hindari %-d (tidak portable di Windows)
+        labels_pretty = [f"{int(d.strftime('%d'))} {d.strftime('%b')}" for d in all_dates]
+
+        categories = ["Open Space", "Space Monitor", "Room Meeting Besar", "Room Meeting Kecil"]
+        dataset_map_counts = {k: [0] * days_count for k in categories}
+
+        cur.execute("""
             SELECT
-                r.nama_ruangan AS item,
-                kr.nama_kategori AS category,
-                COUNT(br.id_booking) AS qty,
-                SUM(t.total_harga_final) AS total
+              DATE(br.waktu_mulai) AS period_date,
+              kr.nama_kategori     AS category,
+              COUNT(*)             AS cnt
+            FROM booking_ruangan br
+            JOIN transaksi t            ON br.id_transaksi = t.id_transaksi
+            JOIN ruangan r              ON r.id_ruangan     = br.id_ruangan
+            JOIN kategori_ruangan kr    ON kr.id_kategori_ruangan = r.id_kategori_ruangan
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+            GROUP BY period_date, category
+            ORDER BY period_date ASC
+        """, (start_date_str, end_date_str))
+        for row in cur.fetchall() or []:
+            key = row["period_date"].strftime('%Y-%m-%d')
+            idx = pos_map.get(key)
+            cat = row["category"]
+            if idx is not None and cat in dataset_map_counts:
+                dataset_map_counts[cat][idx] = int(row["cnt"] or 0)
+
+        dailyRevenue = {
+            "labels": labels_days,          # sumbu-X 1..N
+            "labelsPretty": labels_pretty,  # tooltip "1 Okt", dst.
+            "datasets": dataset_map_counts
+        }
+
+        # ---------- 3) CATEGORY CONTRIBUTION (DOUGHNUT) ----------
+        cur.execute("""
+            SELECT kr.nama_kategori AS name, SUM(t.total_harga_final) AS value
             FROM transaksi t
-            JOIN booking_ruangan br ON t.id_transaksi = br.id_transaksi
-            JOIN ruangan r ON br.id_ruangan = r.id_ruangan
-            JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan
-            WHERE t.status_pembayaran = 'Lunas' 
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s -- PERBAIKAN: Filter berdasarkan tanggal booking
+            JOIN booking_ruangan br  ON br.id_transaksi = t.id_transaksi
+            JOIN ruangan r           ON r.id_ruangan     = br.id_ruangan
+            JOIN kategori_ruangan kr ON kr.id_kategori_ruangan = r.id_kategori_ruangan
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+            GROUP BY name
+        """, (start_date_str, end_date_str))
+        categoryContribution = [
+            {"name": r["name"], "value": int(r["value"] or 0)}
+            for r in (cur.fetchall() or [])
+        ]
+
+        # ---------- 4) PACKAGE BY DURATION (HANYA dari paket_harga_ruangan) ----------
+        # Sumbu-X durasi dari paket (distinct & urut)
+        cur.execute("""
+          SELECT DISTINCT durasi_jam
+          FROM paket_harga_ruangan
+          WHERE durasi_jam IS NOT NULL
+          ORDER BY durasi_jam ASC
+        """)
+        durations = [int(r["durasi_jam"]) for r in (cur.fetchall() or [])]
+
+        # Hitung booking yang MATCH paket (id_ruangan sama & durasi jam sama PERSIS)
+        # TIMESTAMPDIFF(HOUR, ...) melakukan floor — cocok jika booking dibuat pas per jam.
+        cur.execute("""
+          SELECT
+            p.durasi_jam AS durasi_jam,
+            COUNT(*) AS total_booking,
+            COUNT(DISTINCT COALESCE(t.nama_guest, CAST(t.id_user AS CHAR))) AS total_user,
+            COALESCE(SUM(t.total_harga_final), 0) AS total_revenue
+          FROM booking_ruangan br
+          JOIN transaksi t ON t.id_transaksi = br.id_transaksi
+          JOIN paket_harga_ruangan p
+            ON p.id_ruangan = br.id_ruangan
+           AND p.durasi_jam = TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai)
+          WHERE t.status_pembayaran = 'Lunas'
+            AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+          GROUP BY p.durasi_jam
+        """, (start_date_str, end_date_str))
+        agg = {
+            int(r["durasi_jam"]): {
+                "total_booking": int(r["total_booking"] or 0),
+                "total_user":    int(r["total_user"] or 0),
+                "total_revenue": int(r["total_revenue"] or 0),
+            }
+            for r in (cur.fetchall() or [])
+        }
+
+        packageByDuration = []
+        for dj in durations:
+            a = agg.get(dj, {"total_booking": 0, "total_user": 0, "total_revenue": 0})
+            packageByDuration.append({
+                "durasi_jam": dj,
+                "total_booking": a["total_booking"],
+                "total_user": a["total_user"],
+                "total_revenue": a["total_revenue"],
+            })
+
+        # ---------- 5) TOP 10 WORKING SPACES ----------
+        cur.execute("""
+            SELECT
+              r.nama_ruangan   AS item,
+              kr.nama_kategori AS category,
+              COUNT(br.id_booking)      AS qty,
+              SUM(t.total_harga_final)  AS total
+            FROM transaksi t
+            JOIN booking_ruangan br  ON br.id_transaksi = t.id_transaksi
+            JOIN ruangan r           ON r.id_ruangan     = br.id_ruangan
+            JOIN kategori_ruangan kr ON kr.id_kategori_ruangan = r.id_kategori_ruangan
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
             GROUP BY item, category
-            ORDER BY total DESC
-            LIMIT 10;
-        """
-        cursor.execute(query_top_spaces, (start_date_str, end_date_str))
-        top_spaces = cursor.fetchall()
-        
-        # PERBAIKAN: Konversi 'qty' dan 'total' ke integer
-        for item in top_spaces:
-            item['qty'] = int(item['qty'])
-            item['total'] = int(item['total'])
+            ORDER BY qty DESC, total DESC
+            LIMIT 10
+        """, (start_date_str, end_date_str))
+        topSpaces = [{
+            "item": r["item"],
+            "category": r["category"],
+            "qty": int(r["qty"] or 0),
+            "total": int(r["total"] or 0),
+        } for r in (cur.fetchall() or [])]
 
         return jsonify({
             "message": "OK",
             "datas": {
                 "stats": stats,
-                "dailyRevenue": daily_revenue,
-                "categoryContribution": category_contribution,
-                "hourlyTraffic": hourly_traffic,
-                "topSpaces": top_spaces
+                "dailyRevenue": dailyRevenue,
+                "categoryContribution": categoryContribution,
+                "packageByDuration": packageByDuration,
+                "topSpaces": topSpaces
             }
-        })
-        
+        }), 200
+
     except Exception as e:
-        print(f"Error in /admin/ws-dashboard-data: {e}")
+        print("Error in /api/v1/admin/ws-dashboard-data:", e)
+        traceback.print_exc()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor: cursor.close()
-        if connection: connection.close()
-        
-        
+        try:
+            if cur: cur.close()
+        finally:
+            if conn: conn.close()
+# ------------------- END WS DASHBOARD -------------------

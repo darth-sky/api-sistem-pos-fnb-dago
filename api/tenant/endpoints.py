@@ -278,20 +278,22 @@ def read_order_tenant(id_tenant):
         cursor.close()
         conn.close()
 
-
 @tenant_endpoints.route("/readProduktenant/<int:id_tenant>", methods=["GET"])
 def read_produk_tenant(id_tenant):
+    conn = None # Inisialisasi
+    cursor = None # Inisialisasi
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
 
         query = """
-        SELECT 
+        SELECT
             p.id_produk,
             p.nama_produk AS product,
             p.deskripsi_produk AS deskripsi,
             p.harga AS price,
             p.status_ketersediaan AS status,
+            p.status_visibilitas, -- <-- Bisa ditambahkan jika frontend perlu info ini juga
             p.foto_produk AS foto,
             k.nama_kategori AS category,
             t.nama_tenant AS merchant,
@@ -300,6 +302,7 @@ def read_produk_tenant(id_tenant):
         JOIN kategori_produk k ON p.id_kategori = k.id_kategori
         LEFT JOIN tenants t ON k.id_tenant = t.id_tenant
         WHERE t.id_tenant = %s
+          AND p.status_visibilitas = 'Aktif' -- <-- TAMBAHKAN BARIS INI
         ORDER BY p.id_produk DESC
         """
 
@@ -308,8 +311,12 @@ def read_produk_tenant(id_tenant):
         return jsonify({"message": "OK", "datas": results}), 200
 
     except Exception as e:
+        print(f"Error reading tenant products: {e}") # Logging error
+        import traceback
+        traceback.print_exc()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
+        # Pastikan cursor dan koneksi ditutup
         if cursor:
             cursor.close()
         if conn:

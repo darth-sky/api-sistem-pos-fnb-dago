@@ -98,3 +98,4 @@ def profile():
         "email": identity.get("email"),
         "roles": roles
     })
+    
