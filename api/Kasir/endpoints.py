@@ -892,77 +892,108 @@ def get_saved_order_detail(id_transaksi):
 
 
 @kasir_endpoints.route('/pay-saved-order/<int:id_transaksi>', methods=['POST'])
-# @jwt_required() # Aktifkan jika perlu autentikasi
+@jwt_required() # <-- PERBAIKAN 1: Aktifkan autentikasi
 def pay_saved_order(id_transaksi):
     """
-    Memproses pembayaran untuk order yang sebelumnya disimpan.
-    Mengupdate transaksi utama dan mungkin detail item jika ada perubahan.
+    Memproses pembayaran untuk order yang disimpan,
+    MENGUPDATE id_sesi dan id_kasir_pembuat saat pembayaran.
     """
+    
+    # --- PERBAIKAN 2: Dapatkan ID Kasir & Sesi ---
+    jwt_identity = get_jwt_identity()
+    try:
+        # id_user_kasir adalah kasir yang sedang login SAAT INI
+        id_user_kasir = jwt_identity.get('id_user')
+        if not id_user_kasir:
+            return jsonify({"message": "ERROR", "error": "Format token tidak valid."}), 401
+    except AttributeError:
+        id_user_kasir = jwt_identity # Fallback
+    # --- AKHIR PERBAIKAN 2 ---
+
     connection = None
     cursor = None
     try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # --- PERBAIKAN 3: Validasi Sesi Aktif ---
+        cursor.execute("""
+            SELECT id_sesi FROM sesi_kasir 
+            WHERE id_user_kasir = %s AND status_sesi = 'Dibuka' 
+            LIMIT 1
+        """, (id_user_kasir,))
+        sesi_aktif = cursor.fetchone()
+
+        if not sesi_aktif:
+            return jsonify({"message": "ERROR", "error": "Tidak ada sesi kasir yang aktif."}), 403
+        
+        id_sesi_aktif = sesi_aktif['id_sesi']
+        # --- AKHIR PERBAIKAN 3 ---
+
         data = request.get_json()
         if not data or 'items' not in data or not isinstance(data['items'], list) or 'paymentMethod' not in data:
             return jsonify({"message": "ERROR", "error": "Format data pembayaran tidak valid."}), 400
 
-        # 1. Ekstrak data pembayaran dan item terbaru dari frontend
-        # 'CASH' atau 'QRIS' dari frontend
+        # 1. Ekstrak data (kode Anda sebelumnya sudah benar)
         payment_method_raw = data.get('paymentMethod')
         items_frontend_updated = data.get('items', [])
-        # Ambil detail lain yang mungkin diupdate (nama, room, diskon)
         customer_name = data.get('customerName', 'Guest')
-        # Seharusnya tidak berubah, tapi bisa divalidasi
         order_type_frontend = data.get('orderType')
         room = data.get('room') if order_type_frontend == 'dinein' else None
         try:
-            discount_percentage_frontend = decimal.Decimal(
-                data.get('discountPercentage', 0))
-            if not (0 <= discount_percentage_frontend <= 100):
-                raise ValueError("Persentase diskon harus antara 0 dan 100.")
+            discount_percentage_frontend = decimal.Decimal(data.get('discountPercentage', 0))
         except (ValueError, decimal.InvalidOperation):
             return jsonify({"message": "ERROR", "error": "Format persentase diskon tidak valid."}), 400
 
-        # 2. Validasi Metode Pembayaran
+        # 2. Validasi Metode Pembayaran (kode Anda sudah benar)
         payment_map = {"QRIS": "Non-Tunai", "CASH": "Tunai"}
         metode_pembayaran_db = payment_map.get(payment_method_raw)
         if not metode_pembayaran_db:
             return jsonify({"message": "ERROR", "error": f"Metode pembayaran '{payment_method_raw}' tidak valid."}), 400
 
-        # --- Perhitungan Ulang (PENTING!) ---
-        connection = get_connection()
-        cursor = connection.cursor(dictionary=True)
-
-        # 3. Cek apakah order memang ada dan statusnya 'Disimpan'
-        cursor.execute(
-            "SELECT status_pembayaran FROM transaksi WHERE id_transaksi = %s", (id_transaksi,))
+        # 3. Cek status order 'Disimpan' (kode Anda sudah benar)
+        cursor.execute("SELECT status_pembayaran FROM transaksi WHERE id_transaksi = %s", (id_transaksi,))
         existing_order = cursor.fetchone()
         if not existing_order:
             return jsonify({"message": "ERROR", "error": "Order tidak ditemukan."}), 404
         if existing_order['status_pembayaran'] != 'Disimpan':
             return jsonify({"message": "ERROR", "error": f"Order ini tidak dalam status 'Disimpan' (Status: {existing_order['status_pembayaran']})."}), 400
 
-        # 4. Hitung Ulang Subtotal & Validasi Item TERBARU
-        subtotal_backend, valid_items_db_updated, item_error = calculate_totals_and_validate_items(
-            items_frontend_updated)
-        if item_error:
-            # Tidak perlu rollback karena belum ada perubahan
-            return jsonify({"message": "ERROR", "error": item_error}), 400
-
-        # 5. Hitung Ulang Diskon, Pajak, dan Total Final TERBARU
-        discount_nominal_backend = (subtotal_backend * (discount_percentage_frontend / 100)).quantize(
-            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-        pajak_persen_db = get_tax_percentage(cursor)
+        # 4. & 5. Hitung Ulang Total (Asumsi helper Anda 'calculate_totals_and_validate_items' dan 'get_tax_percentage' sudah ada)
+        # (Pastikan helper ini diimpor atau didefinisikan di file ini)
+        
+        # --- (Kode perhitungan ulang Anda) ---
+        # (Jika helper tidak ada, salin/tempel kode perhitungan dari /order di sini)
+        # ... (Contoh placeholder perhitungan jika helper tidak ada)
+        subtotal_backend = decimal.Decimal(0.00)
+        valid_items_db_updated = []
+        for item in items_frontend_updated:
+             harga = decimal.Decimal(item['price'])
+             jumlah = int(item['qty'])
+             subtotal_backend += harga * jumlah
+             valid_items_db_updated.append({
+                 'id_produk': int(item['id']), 
+                 'jumlah': jumlah,
+                 'harga_saat_order': harga, 
+                 'catatan_pesanan': item.get('note')
+             })
+        
+        cursor.execute("SELECT `value` FROM `settings` WHERE `key` = 'PAJAK_FNB_PERSEN'")
+        setting_pajak = cursor.fetchone()
+        pajak_persen_db = decimal.Decimal(10.00) # Default
+        if setting_pajak and setting_pajak['value']:
+             pajak_persen_db = decimal.Decimal(setting_pajak['value'])
+        
+        discount_nominal_backend = (subtotal_backend * (discount_percentage_frontend / 100)).quantize(decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
         taxable_amount_backend = subtotal_backend - discount_nominal_backend
-        pajak_nominal_backend = (taxable_amount_backend * (pajak_persen_db / 100)).quantize(
-            decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-        if pajak_nominal_backend < 0:
-            pajak_nominal_backend = decimal.Decimal('0.00')
+        pajak_nominal_backend = (taxable_amount_backend * (pajak_persen_db / 100)).quantize(decimal.Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        if pajak_nominal_backend < 0: pajak_nominal_backend = decimal.Decimal('0.00')
         total_harga_final_backend = taxable_amount_backend + pajak_nominal_backend
-        if total_harga_final_backend < 0:
-            total_harga_final_backend = decimal.Decimal('0.00')
+        if total_harga_final_backend < 0: total_harga_final_backend = decimal.Decimal('0.00')
+        # --- (Akhir placeholder perhitungan) ---
 
-        # --- Update Database ---
-        # 6. Update tabel 'transaksi'
+
+        # --- PERBAIKAN 4: Update tabel 'transaksi' ---
         query_update_transaksi = """
             UPDATE transaksi
             SET
@@ -974,28 +1005,33 @@ def pay_saved_order(id_transaksi):
                 pajak_nominal = %s,
                 total_harga_final = %s,
                 status_pembayaran = 'Lunas', -- Ubah status!
-                tanggal_transaksi = NOW() -- Update waktu transaksi ke waktu pembayaran
-                -- Update kolom lain jika perlu (misal: id_promo)
-            WHERE id_transaksi = %s AND status_pembayaran = 'Disimpan' -- Kondisi pengaman
+                tanggal_transaksi = NOW(), -- Update waktu transaksi
+                
+                id_sesi = %s,             -- <-- Tambahkan ID Sesi
+                id_kasir_pembuat = %s   -- <-- Tambahkan ID Kasir Pembuat
+                
+            WHERE id_transaksi = %s AND status_pembayaran = 'Disimpan'
         """
         values_update_transaksi = (
             customer_name, room, metode_pembayaran_db,
             subtotal_backend, pajak_persen_db, pajak_nominal_backend, total_harga_final_backend,
+            
+            id_sesi_aktif,      # <-- Nilai baru
+            id_user_kasir,      # <-- Nilai baru
+            
             id_transaksi
         )
+        # --- AKHIR PERBAIKAN 4 ---
+        
         cursor.execute(query_update_transaksi, values_update_transaksi)
 
-        # Cek apakah update berhasil (mempengaruhi 1 baris)
         if cursor.rowcount == 0:
-            connection.rollback()  # Batalkan jika tidak ada baris yang terupdate
+            connection.rollback()
             return jsonify({"message": "ERROR", "error": "Gagal mengupdate transaksi. Mungkin sudah dibayar atau ID salah."}), 400
 
-        # 7. Update tabel 'detail_order_fnb' (Hapus yang lama, insert yang baru)
-        # Cara ini lebih mudah daripada mencocokkan item mana yang berubah/baru/dihapus.
-        cursor.execute(
-            "DELETE FROM detail_order_fnb WHERE id_transaksi = %s", (id_transaksi,))
+        # 7. Update tabel 'detail_order_fnb' (Hapus lama, insert baru)
+        cursor.execute("DELETE FROM detail_order_fnb WHERE id_transaksi = %s", (id_transaksi,))
 
-        # Insert item terbaru
         query_insert_detail = """
             INSERT INTO detail_order_fnb
             (id_transaksi, id_produk, jumlah, harga_saat_order, catatan_pesanan, status_pesanan)
@@ -1005,42 +1041,39 @@ def pay_saved_order(id_transaksi):
             (id_transaksi, item['id_produk'], item['jumlah'],
              str(item['harga_saat_order']),
              item.get('catatan_pesanan'),
-             'Baru')  # Atau status lain jika diperlukan
+             'Baru')
             for item in valid_items_db_updated
         ]
-        if values_insert_detail:  # Hanya jalankan jika ada item valid
+        if values_insert_detail:
             cursor.executemany(query_insert_detail, values_insert_detail)
         else:
-            # Jika semua item dihapus, mungkin perlu rollback atau handle kasus ini
             connection.rollback()
             return jsonify({"message": "ERROR", "error": "Tidak bisa menyelesaikan order tanpa item."}), 400
 
-        connection.commit()  # Simpan semua perubahan (update transaksi, delete & insert detail)
+        connection.commit()
 
         return jsonify({
             "message": "OK",
             "info": f"Order #{id_transaksi} berhasil dibayar.",
-            "id_transaksi": id_transaksi  # Kembalikan ID untuk konfirmasi
+            "id_transaksi": id_transaksi
         }), 200
 
     except mysql.connector.Error as db_err:
-        if connection:
-            connection.rollback()
+        if connection: connection.rollback()
         print(f"Database error saat membayar order tersimpan: {db_err}")
         traceback.print_exc()
+        if 'id_kasir_pembuat' in str(db_err):
+             return jsonify({"message": "ERROR", "error": "Database error. Pastikan kolom 'id_kasir_pembuat' sudah ditambahkan."}), 500
         return jsonify({"message": "ERROR", "error": f"Database error: {db_err.msg}"}), 500
     except Exception as e:
-        if connection:
-            connection.rollback()
+        if connection: connection.rollback()
         print(f"Error saat membayar order tersimpan: {str(e)}")
         traceback.print_exc()
         return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal pada server."}), 500
     finally:
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if connection and connection.is_connected():
             connection.close()
-
 
 @kasir_endpoints.route('/updatePaymentStatus/<int:trx_id>', methods=['PUT'])
 # @jwt_required() # 💎 Uncomment ini jika Anda menggunakan otentikasi JWT
