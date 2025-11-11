@@ -100,6 +100,9 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
         status_pembayaran = data.get("status_pembayaran", "Lunas")
         
         booking_source = data.get("booking_source", "PrivateOffice") # Default 'PrivateOffice'
+        
+        include_saturday = data.get("include_saturday", False)
+        include_sunday = data.get("include_sunday", False)
 
         # Validasi Input Dasar
         if not all([room_ids, tanggal_mulai_str, tanggal_selesai_str, isinstance(jam_mulai_int, int), isinstance(jam_selesai_int, int)]):
@@ -136,6 +139,21 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
         # --- TAHAP 1: VALIDASI PER HARI & KALKULASI HARGA ---
         current_date_check = tanggal_mulai_date
         while current_date_check <= tanggal_selesai_date:
+            # 👇 --- TAMBAHKAN BLOK LOGIKA INI --- 👇
+            # Cek hari apa ini. weekday() -> Senin=0, ..., Sabtu=5, Minggu=6
+            day_of_week = current_date_check.weekday() 
+            
+            # Jika hari ini Sabtu (5) DAN checkbox 'include_saturday' tidak dicentang
+            if day_of_week == 5 and not include_saturday:
+                current_date_check += timedelta(days=1) # Pindah ke hari berikutnya
+                continue # Skip sisa loop, lanjut ke iterasi berikutnya (Minggu)
+
+            # Jika hari ini Minggu (6) DAN checkbox 'include_sunday' tidak dicentang
+            if day_of_week == 6 and not include_sunday:
+                current_date_check += timedelta(days=1) # Pindah ke hari berikutnya
+                continue # Skip sisa loop, lanjut ke iterasi berikutnya (Senin)
+            
+            
             waktu_mulai_dt = datetime.combine(current_date_check, datetime.min.time()).replace(hour=jam_mulai_int)
             # Penting: Jika jam selesai adalah 0 (tengah malam), itu berarti akhir hari SEBELUMNYA.
             # Namun, karena inputnya jam (misal 17), kita tetap di hari yang sama.
@@ -794,7 +812,7 @@ def get_workspaces_summary():
              "category": "Working Space",
              "title": "Space Lesehan",
              "desc": "Space lesehan dengan dudukan bantal dan meja.",
-             "img": "space-lesehan1.jpeg",
+             "img": "space_lesehan.jpg",
              "capacity": "Fleksibel",
              "time": "08:00 - 22:00",
              "date": datetime.now().strftime("%d %b %Y"),

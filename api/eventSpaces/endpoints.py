@@ -14,11 +14,11 @@ eventspaces_endpoints = Blueprint("eventspaces_endpoints", __name__)
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")  # default Gmail
 SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 EMAIL_SENDER = os.getenv("EMAIL_SENDER",
-                         "dipacandrasanti2@gmail.com")  # email sistem pengirim
+                         "dagocreativehub@gmail.com")  # email sistem pengirim
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD",
                            "xhxs podr zrxk tlay")  # app password
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL",
-                        "gungdiahpram5@gmail.com")  # email tujuan admin
+                        "mohamedizzykilian@gmail.com")  # email tujuan admin
 
 
 def send_email_notification(subject,

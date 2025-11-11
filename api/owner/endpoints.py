@@ -1,9 +1,320 @@
 # owner_endpoints.py
+import decimal
+import traceback
 from flask import Blueprint, jsonify, request
+from flask_jwt_extended import jwt_required
 from helper.db_helper import get_connection
 from datetime import date, datetime, timedelta  # <-- tambahkan date
 
 owner_endpoints = Blueprint('owner_endpoints', __name__)
+
+
+
+
+@owner_endpoints.route('/ws-dashboard-data', methods=['GET'])
+def ws_dashboard_data():
+    """
+    Data untuk Working Space Dashboard:
+    - stats: totalRevenue, totalBookings, totalVisitors
+    - dailyRevenue: labels -> ['1','2',...,'N'] (hari dalam range, berurutan TANPA loncat)
+                    labelsPretty -> ['1 Okt','2 Okt', ...] untuk tooltip
+                    datasets -> jumlah booking per kategori/hari
+    - categoryContribution: [{name, value}] (revenue per kategori)
+    - packageByDuration: sumbu-X = DISTINCT paket_harga_ruangan.durasi_jam (saja),
+                         hitung booking yang MATCH paket pada RUANGAN yang sama
+                         -> [{durasi_jam, total_booking, total_user, total_revenue}]
+    - topSpaces: Top 10 ruang urut qty booking DESC, tie-break total DESC
+    """
+    conn = None
+    cur = None
+    try:
+        # default ke bulan berjalan
+        today = date.today()
+        start_date_str = request.args.get('startDate', today.replace(day=1).strftime('%Y-%m-%d'))
+        end_date_str   = request.args.get('endDate',   today.strftime('%Y-%m-%d'))
+
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        end_date   = datetime.strptime(end_date_str,   '%Y-%m-%d').date()
+        if end_date < start_date:
+            return jsonify({"message": "ERROR", "error": "endDate < startDate"}), 400
+
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
+        # ---------- 1) STATS ----------
+        cur.execute("""
+            SELECT
+              COALESCE(SUM(t.total_harga_final), 0)                           AS totalRevenue,
+              COUNT(br.id_booking)                                            AS totalBookings,
+              COUNT(DISTINCT COALESCE(t.nama_guest, CAST(t.id_user AS CHAR))) AS totalVisitors
+            FROM booking_ruangan br
+            JOIN transaksi t ON t.id_transaksi = br.id_transaksi
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+        """, (start_date_str, end_date_str))
+        s = cur.fetchone() or {}
+        stats = {
+            "totalRevenue": int(s.get("totalRevenue") or 0),
+            "totalBookings": int(s.get("totalBookings") or 0),
+            "totalVisitors": int(s.get("totalVisitors") or 0),
+        }
+
+        # ---------- 2) DAILY BOOKING (labels = hari 1..N) ----------
+        days_count = (end_date - start_date).days + 1
+        all_dates = [start_date + timedelta(days=i) for i in range(days_count)]
+        pos_map = {(start_date + timedelta(days=i)).strftime('%Y-%m-%d'): i for i in range(days_count)}
+
+        labels_days   = [str(d.day) for d in all_dates]  # "1".."N"
+        # Hindari %-d (tidak portable di Windows)
+        labels_pretty = [f"{int(d.strftime('%d'))} {d.strftime('%b')}" for d in all_dates]
+
+        categories = ["Open Space", "Space Monitor", "Room Meeting Besar", "Room Meeting Kecil"]
+        dataset_map_counts = {k: [0] * days_count for k in categories}
+
+        cur.execute("""
+            SELECT
+              DATE(br.waktu_mulai) AS period_date,
+              kr.nama_kategori     AS category,
+              COUNT(*)             AS cnt
+            FROM booking_ruangan br
+            JOIN transaksi t            ON br.id_transaksi = t.id_transaksi
+            JOIN ruangan r              ON r.id_ruangan     = br.id_ruangan
+            JOIN kategori_ruangan kr    ON kr.id_kategori_ruangan = r.id_kategori_ruangan
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+            GROUP BY period_date, category
+            ORDER BY period_date ASC
+        """, (start_date_str, end_date_str))
+        for row in cur.fetchall() or []:
+            key = row["period_date"].strftime('%Y-%m-%d')
+            idx = pos_map.get(key)
+            cat = row["category"]
+            if idx is not None and cat in dataset_map_counts:
+                dataset_map_counts[cat][idx] = int(row["cnt"] or 0)
+
+        dailyRevenue = {
+            "labels": labels_days,          # sumbu-X 1..N
+            "labelsPretty": labels_pretty,  # tooltip "1 Okt", dst.
+            "datasets": dataset_map_counts
+        }
+
+        # ---------- 3) CATEGORY CONTRIBUTION (DOUGHNUT) ----------
+        cur.execute("""
+            SELECT kr.nama_kategori AS name, SUM(t.total_harga_final) AS value
+            FROM transaksi t
+            JOIN booking_ruangan br  ON br.id_transaksi = t.id_transaksi
+            JOIN ruangan r           ON r.id_ruangan     = br.id_ruangan
+            JOIN kategori_ruangan kr ON kr.id_kategori_ruangan = r.id_kategori_ruangan
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+            GROUP BY name
+        """, (start_date_str, end_date_str))
+        categoryContribution = [
+            {"name": r["name"], "value": int(r["value"] or 0)}
+            for r in (cur.fetchall() or [])
+        ]
+
+        # ---------- 4) PACKAGE BY DURATION (HANYA dari paket_harga_ruangan) ----------
+        # Sumbu-X durasi dari paket (distinct & urut)
+        cur.execute("""
+          SELECT DISTINCT durasi_jam
+          FROM paket_harga_ruangan
+          WHERE durasi_jam IS NOT NULL
+          ORDER BY durasi_jam ASC
+        """)
+        durations = [int(r["durasi_jam"]) for r in (cur.fetchall() or [])]
+
+        # Hitung booking yang MATCH paket (id_ruangan sama & durasi jam sama PERSIS)
+        # TIMESTAMPDIFF(HOUR, ...) melakukan floor — cocok jika booking dibuat pas per jam.
+        cur.execute("""
+          SELECT
+            p.durasi_jam AS durasi_jam,
+            COUNT(*) AS total_booking,
+            COUNT(DISTINCT COALESCE(t.nama_guest, CAST(t.id_user AS CHAR))) AS total_user,
+            COALESCE(SUM(t.total_harga_final), 0) AS total_revenue
+          FROM booking_ruangan br
+          JOIN transaksi t ON t.id_transaksi = br.id_transaksi
+          JOIN paket_harga_ruangan p
+            ON p.id_ruangan = br.id_ruangan
+           AND p.durasi_jam = TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai)
+          WHERE t.status_pembayaran = 'Lunas'
+            AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+          GROUP BY p.durasi_jam
+        """, (start_date_str, end_date_str))
+        agg = {
+            int(r["durasi_jam"]): {
+                "total_booking": int(r["total_booking"] or 0),
+                "total_user":    int(r["total_user"] or 0),
+                "total_revenue": int(r["total_revenue"] or 0),
+            }
+            for r in (cur.fetchall() or [])
+        }
+
+        packageByDuration = []
+        for dj in durations:
+            a = agg.get(dj, {"total_booking": 0, "total_user": 0, "total_revenue": 0})
+            packageByDuration.append({
+                "durasi_jam": dj,
+                "total_booking": a["total_booking"],
+                "total_user": a["total_user"],
+                "total_revenue": a["total_revenue"],
+            })
+
+        # ---------- 5) TOP 10 WORKING SPACES ----------
+        cur.execute("""
+            SELECT
+              r.nama_ruangan   AS item,
+              kr.nama_kategori AS category,
+              COUNT(br.id_booking)      AS qty,
+              SUM(t.total_harga_final)  AS total
+            FROM transaksi t
+            JOIN booking_ruangan br  ON br.id_transaksi = t.id_transaksi
+            JOIN ruangan r           ON r.id_ruangan     = br.id_ruangan
+            JOIN kategori_ruangan kr ON kr.id_kategori_ruangan = r.id_kategori_ruangan
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
+            GROUP BY item, category
+            ORDER BY qty DESC, total DESC
+            LIMIT 10
+        """, (start_date_str, end_date_str))
+        topSpaces = [{
+            "item": r["item"],
+            "category": r["category"],
+            "qty": int(r["qty"] or 0),
+            "total": int(r["total"] or 0),
+        } for r in (cur.fetchall() or [])]
+
+        return jsonify({
+            "message": "OK",
+            "datas": {
+                "stats": stats,
+                "dailyRevenue": dailyRevenue,
+                "categoryContribution": categoryContribution,
+                "packageByDuration": packageByDuration,
+                "topSpaces": topSpaces
+            }
+        }), 200
+
+    except Exception as e:
+        print("Error in /api/v1/admin/ws-dashboard-data:", e)
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        try:
+            if cur: cur.close()
+        finally:
+            if conn: conn.close()
+# ------------------- END WS DASHBOARD -------------------
+
+
+@owner_endpoints.route('/laporan-pajak-data', methods=['GET'])
+@jwt_required()
+def get_laporan_pajak_data():
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date')
+
+    if not start_date_str or not end_date_str:
+        return jsonify({"message": "ERROR", "error": "Parameter start_date dan end_date diperlukan."}), 400
+
+    try:
+        # Konversi tanggal (Kode ini sudah benar)
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        end_date_for_query = end_date + timedelta(days=1)
+
+    except ValueError:
+        return jsonify({"message": "ERROR", "error": "Format tanggal tidak valid (YYYY-MM-DD)."}), 400
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # === PERUBAHAN QUERY PENDAPATAN ===
+        # Hitung Total Pendapatan HANYA dari transaksi F&B yang Lunas
+        cursor.execute("""
+            SELECT SUM(t.total_harga_final) as total_pendapatan_fnb
+            FROM transaksi t
+            WHERE t.status_pembayaran = 'Lunas'
+              AND t.tanggal_transaksi >= %s AND t.tanggal_transaksi < %s
+              AND EXISTS ( -- Pastikan transaksi ini punya detail F&B
+                  SELECT 1
+                  FROM detail_order_fnb dof
+                  WHERE dof.id_transaksi = t.id_transaksi
+              )
+        """, (start_date, end_date_for_query))
+        pendapatan_result = cursor.fetchone()
+        # Ganti nama variabel agar lebih jelas
+        total_pendapatan_fnb = pendapatan_result['total_pendapatan_fnb'] or decimal.Decimal(0.00)
+        # === AKHIR PERUBAHAN QUERY PENDAPATAN ===
+
+
+        # (Query pengeluaran - sudah benar)
+        cursor.execute("""
+            SELECT id_pengeluaran, kategori, jumlah, tanggal_pengeluaran
+            FROM pengeluaran_operasional
+            WHERE tanggal_pengeluaran BETWEEN %s AND %s
+            ORDER BY tanggal_pengeluaran DESC
+        """, (start_date, end_date))
+        pengeluaran_list = cursor.fetchall()
+
+        # (Query data pajak - sudah benar)
+        latest_tax_payment = { "paidAmount": 0.0, "paymentDate": None }
+        try:
+            cursor.execute("""
+                SELECT jumlah_dibayar, tanggal_bayar
+                FROM pembayaran_pajak
+                WHERE periode_mulai = %s AND periode_selesai = %s
+                ORDER BY timestamp_catat DESC
+                LIMIT 1
+            """, (start_date, end_date))
+            tax_payment_db = cursor.fetchone()
+            if tax_payment_db:
+                 latest_tax_payment["paidAmount"] = float(tax_payment_db['jumlah_dibayar'])
+                 if isinstance(tax_payment_db.get('tanggal_bayar'), (datetime, date)):
+                     latest_tax_payment["paymentDate"] = tax_payment_db['tanggal_bayar'].isoformat()
+        except Exception as tax_err:
+             print(f"Warning: Could not fetch tax payment data - {tax_err}")
+
+
+        # (Formatting pengeluaran - sudah benar)
+        safe_pengeluaran = []
+        for p in pengeluaran_list:
+             tanggal_pengeluaran = p.get("tanggal_pengeluaran")
+             tanggal_iso = None
+             if isinstance(tanggal_pengeluaran, (datetime, date)):
+                 tanggal_iso = tanggal_pengeluaran.isoformat()
+
+             safe_pengeluaran.append({
+                 "id": p.get("id_pengeluaran"),
+                 "kategori": p.get("kategori"),
+                 "jumlah": float(p.get("jumlah", 0)),
+                 "tanggal": tanggal_iso
+             })
+
+        # === PERUBAHAN NAMA VARIABEL DI RETURN ===
+        return jsonify({
+            "message": "OK",
+            # Kirim pendapatan F&B sebagai field terpisah (atau ganti nama field lama)
+            "total_pendapatan_fnb": float(total_pendapatan_fnb),
+            # Anda mungkin masih ingin mengirim total pendapatan kotor *semua* transaksi?
+            # Jika iya, tambahkan query lain untuk menghitungnya tanpa filter EXISTS
+            # "total_pendapatan_kotor_all": float(total_semua_pendapatan),
+            "pengeluaran_list": safe_pengeluaran,
+            "tax_payment_status": latest_tax_payment
+        }), 200
+        # === AKHIR PERUBAHAN NAMA VARIABEL ===
+
+    except Exception as e:
+        print(f"Error fetching laporan pajak data: {e}")
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()
+      
+
 
 # ==========================
 # Konstanta (ikuti skema DB)
@@ -40,9 +351,6 @@ def _bad_request(msg):
 # ============================================================
 # 1) DASHBOARD SUMMARY / LAPORAN DASHBOARD  (GET /dashboard/summary)
 # ============================================================
-
-
-
 @owner_endpoints.route('/dashboard/summary', methods=['GET'])
 def dashboard_summary():
     start_date, end_date = _req_range()
@@ -476,7 +784,7 @@ def dashboard_summary():
                 pass
 
 # ============================================================
-# 2) OWNER FNB DASHBOARD  (GET /ownerfnb)  
+# 2) OWNER FNB DASHBOARD  (GET /ownerfnb)
 # ============================================================
 @owner_endpoints.route("/ownerfnb", methods=["GET", "OPTIONS"])
 def ownerfnb_dashboard():
@@ -611,6 +919,36 @@ def ownerfnb_dashboard():
             for r in (cur.fetchall() or [])
         ]
 
+        # ---------- 6) UNPOPULAR PRODUCT PER TENANT (ikutkan yang qty = 0) ----------
+        unpopular_sql = """
+            SELECT
+                pf.nama_produk AS item,
+                COALESCE(SUM(dof.jumlah), 0) AS qty,
+                COALESCE(SUM(dof.jumlah * dof.harga_saat_order), 0) AS total
+            FROM produk_fnb pf
+            JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
+            LEFT JOIN detail_order_fnb dof ON dof.id_produk = pf.id_produk
+            LEFT JOIN transaksi t ON t.id_transaksi = dof.id_transaksi
+                AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+                AND t.status_pembayaran = 'Lunas'
+            WHERE kp.id_tenant = %s
+            GROUP BY pf.nama_produk
+            ORDER BY qty ASC, total ASC, pf.nama_produk ASC
+            LIMIT 50
+        """
+        # Dapoer M.S
+        cur.execute(unpopular_sql, (start_date, end_date, TENANT_DAPOER_MS))
+        unpop_dapoer = [
+            {"item": r["item"], "qty": int(r["qty"] or 0), "total": int(r["total"] or 0)}
+            for r in (cur.fetchall() or [])
+        ]
+        # HomeBro
+        cur.execute(unpopular_sql, (start_date, end_date, TENANT_HOME_BRO))
+        unpop_home = [
+            {"item": r["item"], "qty": int(r["qty"] or 0), "total": int(r["total"] or 0)}
+            for r in (cur.fetchall() or [])
+        ]
+
         # ---------- Response ----------
         return jsonify(
             {
@@ -618,19 +956,17 @@ def ownerfnb_dashboard():
                 "datas": {
                     "totals": {
                         "total_fnb": total_fnb,
-                        "total_ws": 0,                  # FNB-only dashboard
-                        "total_sales": total_fnb,       # sama dengan total_fnb
-                        "total_transactions": total_tx, # jumlah transaksi FNB berhasil
-                        "avg_daily": avg_daily,         # rata-rata harian FNB
+                        "total_ws": 0,
+                        "total_sales": total_fnb,
+                        "total_transactions": total_tx,
+                        "avg_daily": avg_daily,
                         "total_days": total_days,
                     },
-                    "daily_selling_per_tenant": daily_selling,  # line chart per tenant
-                    "visitors_by_hour": visitors_by_hour,       # transaksi per jam
-                    "peak_by_hour": peak_by_hour,               # item/menu per jam
-                    "top_fnb": {
-                        "dapoer": top_dapoer,                   # Top 5 DapoerMS
-                        "home": top_home,                       # Top 5 HomeBro
-                    },
+                    "daily_selling_per_tenant": daily_selling,
+                    "visitors_by_hour": visitors_by_hour,
+                    "peak_by_hour": peak_by_hour,
+                    "top_fnb": {"dapoer": top_dapoer, "home": top_home},
+                    "unpopular_fnb": {"dapoer": unpop_dapoer, "home": unpop_home},
                 },
             }
         ), 200
@@ -649,333 +985,4 @@ def ownerfnb_dashboard():
                 conn.close()
             except Exception:
                 pass
-
-
-# ------------------- WS DASHBOARD (ALL UNDER OWNER) -------------------
-@owner_endpoints.route('/ws-dashboard-data', methods=['GET'])
-def ws_dashboard_data():
-    """
-    Data untuk Working Space Dashboard:
-    - stats: totalRevenue, totalBookings, totalVisitors
-    - dailyRevenue: labels ['1'..'N'], labelsPretty ['1 Okt',...], datasets -> amount per kategori/hari
-    - categoryContribution: [{name, value}]
-    - packageByDuration: [{durasi_jam, total_booking, total_user, total_revenue}]
-    - packageByDurationByCategory: { "Open Space":[...], "Space Monitor":[...], "Meeting Room":[...] }
-    - hourlyBookings: total per jam (start-only, hanya jam dengan transaksi)
-    - hourlyBookingsByCategory: breakdown kategori per jam
-    - topSpaces: Top 10 ruang
-    - leastSpaces: 10 ruang yang belum pernah dibooking (qty = 0) sepanjang waktu
-    """
-    conn = None
-    cur = None
-    try:
-        # default: bulan berjalan
-        today = date.today()
-        start_date_str = request.args.get('startDate', today.replace(day=1).strftime('%Y-%m-%d'))
-        end_date_str   = request.args.get('endDate',   today.strftime('%Y-%m-%d'))
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-        end_date   = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-
-        if end_date < start_date:
-            return jsonify({"message": "ERROR", "error": "endDate < startDate"}), 400
-
-        OPEN_HOUR, CLOSE_HOUR = 8, 22
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
-
-        # ---------- 1) STATS ----------
-        cur.execute("""
-            SELECT
-              COALESCE(SUM(t.total_harga_final), 0)                           AS totalRevenue,
-              COUNT(br.id_booking)                                            AS totalBookings,
-              COUNT(DISTINCT COALESCE(t.nama_guest, CAST(t.id_user AS CHAR))) AS totalVisitors
-            FROM booking_ruangan br
-            JOIN transaksi t ON t.id_transaksi = br.id_transaksi
-            WHERE t.status_pembayaran = 'Lunas'
-              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-        """, (start_date_str, end_date_str))
-        s = cur.fetchone() or {}
-        stats = {
-            "totalRevenue": int(s.get("totalRevenue") or 0),
-            "totalBookings": int(s.get("totalBookings") or 0),
-            "totalVisitors": int(s.get("totalVisitors") or 0),
-        }
-
-        # ---------- 2) DAILY BOOKING/REVENUE PER KATEGORI ----------
-        days_count = (end_date - start_date).days + 1
-        all_dates = [start_date + timedelta(days=i) for i in range(days_count)]
-        pos_map = {d.strftime('%Y-%m-%d'): i for i, d in enumerate(all_dates)}
-        labels_days   = [str(d.day) for d in all_dates]
-        labels_pretty = [f"{int(d.strftime('%d'))} {d.strftime('%b')}" for d in all_dates]
-
-        categories = ["Open Space", "Space Monitor", "Room Meeting Besar", "Room Meeting Kecil"]
-        dataset_map_counts = {k: [0]*days_count for k in categories}
-
-        cur.execute("""
-            SELECT
-              DATE(br.waktu_mulai) AS period_date,
-              kr.nama_kategori     AS category,
-              SUM(t.total_harga_final) AS amt
-            FROM booking_ruangan br
-            JOIN transaksi t            ON br.id_transaksi = t.id_transaksi
-            JOIN ruangan r              ON r.id_ruangan     = br.id_ruangan
-            JOIN kategori_ruangan kr    ON kr.id_kategori_ruangan = r.id_kategori_ruangan
-            WHERE t.status_pembayaran = 'Lunas'
-              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-            GROUP BY period_date, category
-            ORDER BY period_date ASC
-        """, (start_date_str, end_date_str))
-        for row in cur.fetchall() or []:
-            key = row["period_date"].strftime('%Y-%m-%d')
-            idx = pos_map.get(key)
-            cat = row["category"]
-            if idx is not None and cat in dataset_map_counts:
-                dataset_map_counts[cat][idx] = int(row["amt"] or 0)
-
-        dailyRevenue = {"labels": labels_days, "labelsPretty": labels_pretty, "datasets": dataset_map_counts}
-
-        # ---------- 3) CATEGORY CONTRIBUTION ----------
-        cur.execute("""
-            SELECT kr.nama_kategori AS name, SUM(t.total_harga_final) AS value
-            FROM transaksi t
-            JOIN booking_ruangan br  ON br.id_transaksi = t.id_transaksi
-            JOIN ruangan r           ON r.id_ruangan     = br.id_ruangan
-            JOIN kategori_ruangan kr ON kr.id_kategori_ruangan = r.id_kategori_ruangan
-            WHERE t.status_pembayaran = 'Lunas'
-              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-            GROUP BY name
-        """, (start_date_str, end_date_str))
-        categoryContribution = [
-            {"name": r["name"], "value": int(r["value"] or 0)}
-            for r in (cur.fetchall() or [])
-        ]
-
-        # ---------- 4) PACKAGE BY DURATION ----------
-        cur.execute("""
-            SELECT DISTINCT durasi_jam
-            FROM paket_harga_ruangan
-            WHERE durasi_jam IS NOT NULL
-            ORDER BY durasi_jam ASC
-        """)
-        durations = [int(r["durasi_jam"]) for r in (cur.fetchall() or [])]
-
-        cur.execute("""
-          SELECT
-            p.durasi_jam AS durasi_jam,
-            COUNT(*) AS total_booking,
-            COUNT(DISTINCT COALESCE(t.nama_guest, CAST(t.id_user AS CHAR))) AS total_user,
-            COALESCE(SUM(t.total_harga_final), 0) AS total_revenue
-          FROM booking_ruangan br
-          JOIN transaksi t ON t.id_transaksi = br.id_transaksi
-          JOIN paket_harga_ruangan p
-            ON p.id_ruangan = br.id_ruangan
-           AND p.durasi_jam = TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai)
-          WHERE t.status_pembayaran = 'Lunas'
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-          GROUP BY p.durasi_jam
-        """, (start_date_str, end_date_str))
-        agg = {int(r["durasi_jam"]): r for r in cur.fetchall() or []}
-        packageByDuration = [{
-            "durasi_jam": dj,
-            "total_booking": int(agg.get(dj, {}).get("total_booking", 0)),
-            "total_user": int(agg.get(dj, {}).get("total_user", 0)),
-            "total_revenue": int(agg.get(dj, {}).get("total_revenue", 0)),
-        } for dj in durations]
-
-        # ---------- 4B) PACKAGE BY DURATION PER CATEGORY ----------
-        cur.execute("""
-          SELECT
-            CASE
-              WHEN kr.nama_kategori IN ('Room Meeting Besar','Room Meeting Kecil') THEN 'Meeting Room'
-              ELSE kr.nama_kategori
-            END AS category,
-            p.durasi_jam AS durasi_jam,
-            COUNT(*)     AS total_booking
-          FROM booking_ruangan br
-          JOIN transaksi t ON t.id_transaksi = br.id_transaksi
-          JOIN ruangan r           ON r.id_ruangan = br.id_ruangan
-          JOIN kategori_ruangan kr ON kr.id_kategori_ruangan = r.id_kategori_ruangan
-          JOIN paket_harga_ruangan p
-            ON p.id_ruangan = br.id_ruangan
-           AND p.durasi_jam = TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai)
-          WHERE t.status_pembayaran = 'Lunas'
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-          GROUP BY category, p.durasi_jam
-        """, (start_date_str, end_date_str))
-        rows = cur.fetchall() or []
-        packageByDurationByCategory = {"Open Space": [], "Space Monitor": [], "Meeting Room": []}
-        for cat in packageByDurationByCategory.keys():
-            valmap = {int(r["durasi_jam"]): int(r["total_booking"]) for r in rows if r["category"] == cat}
-            packageByDurationByCategory[cat] = [{"durasi_jam": dj, "total_booking": valmap.get(dj, 0)} for dj in durations]
-
-        # ---------- 5) HOURLY BOOKINGS + BY CATEGORY ----------
-        cur.execute("""
-          SELECT
-            CASE
-              WHEN kr.nama_kategori IN ('Room Meeting Besar','Room Meeting Kecil') THEN 'Meeting Room'
-              ELSE kr.nama_kategori
-            END AS category,
-            HOUR(br.waktu_mulai) AS hh,
-            COUNT(DISTINCT br.id_booking) AS cnt
-          FROM booking_ruangan br
-          JOIN transaksi t ON t.id_transaksi = br.id_transaksi
-          JOIN ruangan r           ON r.id_ruangan = br.id_ruangan
-          JOIN kategori_ruangan kr ON kr.id_kategori_ruangan = r.id_kategori_ruangan
-          WHERE t.status_pembayaran = 'Lunas'
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-            AND HOUR(br.waktu_mulai) BETWEEN %s AND %s
-          GROUP BY category, hh
-          HAVING cnt > 0
-          ORDER BY hh
-        """, (start_date_str, end_date_str, OPEN_HOUR, CLOSE_HOUR))
-        hrows = cur.fetchall() or []
-        hourlyBookingsByCategory = {}
-        for r in hrows:
-            hh, cat, cnt = str(int(r["hh"])), r["category"], int(r["cnt"])
-            d = hourlyBookingsByCategory.setdefault(hh, {"Open Space": 0, "Space Monitor": 0, "Meeting Room": 0})
-            d[cat] = cnt
-        hourlyBookings = {hh: sum(v.values()) for hh, v in hourlyBookingsByCategory.items()}
-
-         # ---------- 5) POPULAR SPACE ----------
-        cur.execute(
-            """
-            SELECT 
-            CONCAT(
-                CASE 
-                WHEN kr.nama_kategori LIKE '%Meeting%' THEN 'Meeting Room'
-                ELSE kr.nama_kategori
-                END,
-                ' ( ', 
-                COALESCE(p.durasi_jam, TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai)), 
-                ' Jam)'
-            ) AS item,
-            COUNT(*) AS qty,
-            SUM(x.total_transaksi) AS total
-            FROM booking_ruangan br
-            JOIN ruangan r            ON r.id_ruangan = br.id_ruangan
-            JOIN kategori_ruangan kr  ON kr.id_kategori_ruangan = r.id_kategori_ruangan
-            JOIN (
-            SELECT t.id_transaksi, MAX(t.total_harga_final) AS total_transaksi
-            FROM transaksi t
-            WHERE t.status_pembayaran = 'Lunas'
-                AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
-            GROUP BY t.id_transaksi
-            ) x ON x.id_transaksi = br.id_transaksi
-            LEFT JOIN paket_harga_ruangan p
-            ON p.id_ruangan = br.id_ruangan
-            AND p.durasi_jam = TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai)
-            WHERE DATE(br.waktu_mulai) BETWEEN %s AND %s
-            GROUP BY item
-            ORDER BY qty DESC, total DESC
-            LIMIT 5
-            """,
-        (start_date_str, end_date_str, start_date_str, end_date_str),
-        )
-        top_ws = [
-            {"item": r["item"], "qty": int(r["qty"] or 0), "total": float(r["total"] or 0)}
-            for r in (cur.fetchall() or [])
-        ]
-        # ---------- 7) CATEGORY PERFORMANCE (NEW) ----------
-        cur.execute("""
-          SELECT
-            CASE
-              WHEN kr.nama_kategori IN ('Room Meeting Besar','Room Meeting Kecil') THEN 'Meeting Room'
-              ELSE kr.nama_kategori
-            END AS category,
-            COUNT(*) AS bookings,
-            SUM(t.total_harga_final) AS revenue,
-            AVG(TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai)) AS avg_duration_jam
-          FROM booking_ruangan br
-          JOIN transaksi t            ON t.id_transaksi = br.id_transaksi
-          JOIN ruangan r              ON r.id_ruangan = br.id_ruangan
-          JOIN kategori_ruangan kr    ON kr.id_kategori_ruangan = r.id_kategori_ruangan
-          WHERE t.status_pembayaran = 'Lunas'
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-          GROUP BY category
-        """, (start_date_str, end_date_str))
-        categoryPerformance = [
-          {
-            "category": r["category"],
-            "bookings": int(r["bookings"] or 0),
-            "revenue": int(r["revenue"] or 0),
-            "avg_duration_jam": float(r["avg_duration_jam"] or 0.0),
-          }
-          for r in (cur.fetchall() or [])
-        ]
-
-        # ---------- 8) BOOKINGS BY WEEKDAY (NEW) ----------
-        cur.execute("""
-          SELECT WEEKDAY(br.waktu_mulai) AS wday, COUNT(*) AS cnt
-          FROM booking_ruangan br
-          JOIN transaksi t ON t.id_transaksi = br.id_transaksi
-          WHERE t.status_pembayaran = 'Lunas'
-            AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-          GROUP BY wday
-          ORDER BY wday
-        """, (start_date_str, end_date_str))
-        rows_weekday = cur.fetchall() or []
-        weekday_map = {int(r["wday"]): int(r["cnt"]) for r in rows_weekday}
-        bookingsByWeekday = [{"wday": i, "count": weekday_map.get(i, 0)} for i in range(7)]
-
-        # ---------- 9) BOOKINGS BY DATE DETAILED (NEW for Radar Chart) ----------
-        cur.execute("""
-            SELECT
-              DATE(br.waktu_mulai) AS book_date,
-              CASE
-                WHEN kr.nama_kategori IN ('Room Meeting Besar','Room Meeting Kecil') THEN 'Meeting Room'
-                ELSE kr.nama_kategori
-              END AS category,
-              TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai) AS durasi_jam,
-              COUNT(*) AS cnt
-            FROM booking_ruangan br
-            JOIN transaksi t            ON t.id_transaksi = br.id_transaksi
-            JOIN ruangan r              ON r.id_ruangan = br.id_ruangan
-            JOIN kategori_ruangan kr    ON kr.id_kategori_ruangan = r.id_kategori_ruangan
-            WHERE t.status_pembayaran = 'Lunas'
-              AND DATE(br.waktu_mulai) BETWEEN %s AND %s
-            GROUP BY book_date, category, durasi_jam
-            ORDER BY book_date ASC
-        """, (start_date_str, end_date_str))
-        rows_detailed = cur.fetchall() or []
-
-        bookingsByDateDetailed = {}
-        for r in rows_detailed:
-            dstr = r["book_date"].strftime("%Y-%m-%d")
-            cat = r["category"]
-            dur = int(r["durasi_jam"] or 0)
-            cnt = int(r["cnt"] or 0)
-
-            node = bookingsByDateDetailed.setdefault(dstr, {"total": 0, "breakdown": {}})
-            node["total"] += cnt
-            node["breakdown"].setdefault(cat, {})
-            node["breakdown"][cat][str(dur)] = node["breakdown"][cat].get(str(dur), 0) + cnt
-
-        # --- payload ---
-        payload = {
-            "stats": stats,
-            "dailyRevenue": dailyRevenue,
-            "categoryContribution": categoryContribution,
-            "packageByDuration": packageByDuration,
-            "packageByDurationByCategory": packageByDurationByCategory,
-            "hourlyBookings": hourlyBookings,
-            "hourlyBookingsByCategory": hourlyBookingsByCategory,
-            "top_ws": top_ws,
-            "categoryPerformance": categoryPerformance,
-            "bookingsByWeekday": bookingsByWeekday,
-            "bookingsByDateDetailed": bookingsByDateDetailed,
-        }
-
-        return jsonify({"message": "OK", **payload, "datas": payload}), 200
-    
-    except Exception as e:
-        print("Error in /ws-dashboard-data:", e)
-        import traceback; traceback.print_exc()
-        return jsonify({"message": "ERROR", "error": str(e)}), 500
-    finally:
-        try:
-            if cur: cur.close()
-        except: pass
-        try:
-            if conn: conn.close()
-        except: pass
-# ------------------- END WS DASHBOARD (ALL UNDER OWNER) -------------------
+# ============================================================

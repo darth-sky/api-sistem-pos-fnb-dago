@@ -12,21 +12,26 @@ auth_endpoints = Blueprint('auth', __name__)
 
 
 # Di file auth_endpoints.py Anda
-
 @auth_endpoints.route('/login', methods=['POST'])
 def login():
     """Route for authentication"""
-    email = request.form.get('email')
+    # MODIFIKASI: Ambil 'identifier' dari form
+    identifier = request.form.get('identifier')
     password = request.form.get('password')
 
-    if not email or not password:
-        return jsonify({"msg": "Email and password are required"}), 400
+    # MODIFIKASI: Ubah pesan validasi
+    if not identifier or not password:
+        return jsonify({"msg": "Email/Username and password are required"}), 400
 
     try:
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
-        query = "SELECT * FROM users WHERE email = %s"
-        cursor.execute(query, (email,))
+
+        # MODIFIKASI: Ubah query SQL untuk mencari di kedua kolom
+        query = "SELECT * FROM users WHERE email = %s OR nama = %s"
+
+        # MODIFIKASI: Kirim 'identifier' untuk kedua parameter
+        cursor.execute(query, (identifier, identifier))
         user = cursor.fetchone()
     except Exception as e:
         return jsonify({"msg": f"Database error: {str(e)}"}), 500
@@ -36,11 +41,13 @@ def login():
         if connection:
             connection.close()
 
+    # MODIFIKASI: Ubah pesan error
     if not user or not bcrypt.check_password_hash(user.get('password'), password):
-        return jsonify({"msg": "Bad email or password"}), 401
+        return jsonify({"msg": "Bad email/username or password"}), 401
 
+    # Sisa kode (pembuatan token) tidak perlu diubah
     access_token = create_access_token(
-        identity={'email': email, 'id_user': user.get('id_user')}, 
+        identity={'email': user.get('email'), 'id_user': user.get('id_user')},
         additional_claims={'roles': user.get('role'), 'id_user': user.get('id_user')}
     )
     decoded_token = decode_token(access_token)
@@ -50,9 +57,8 @@ def login():
         "access_token": access_token,
         "expires_in": expires,
         "type": "Bearer",
-        # TAMBAHAN KUNCI: Kirim status first_login ke frontend
         "is_first_login": user.get('is_first_login'),
-        "role": user.get('role') # Kirim role juga untuk mempermudah frontend
+        "role": user.get('role')
     })
 
 
@@ -113,18 +119,41 @@ def register():
     password = request.form.get('password')
 
     if not nama or not email or not password:
-        return jsonify({"msg": "Nama, email, and password are required"}), 400
+        return jsonify({"message": "Nama, email, dan password wajib diisi"}), 400
 
     hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
-
+    connection = None
+    cursor = None
+    
     try:
         connection = get_connection()
-        cursor = connection.cursor()
+        cursor = connection.cursor(dictionary=True) # Gunakan dictionary=True untuk cek
+
+        # --- PERBAIKAN DI SINI ---
+        # Langkah 1: Cek apakah email sudah ada
+        cursor.execute("SELECT 1 FROM users WHERE email = %s", (email,))
+        if cursor.fetchone():
+            return jsonify({"message": "Email ini sudah terdaftar. Silakan gunakan email lain."}), 409 # 409 Conflict
+
+        # Langkah 2: Cek apakah nama (username) sudah ada
+        cursor.execute("SELECT 1 FROM users WHERE nama = %s", (nama,))
+        if cursor.fetchone():
+            return jsonify({"message": "Username ini sudah terpakai. Silakan gunakan nama lain."}), 409 # 409 Conflict
+        # --- AKHIR PERBAIKAN ---
+
+        # Langkah 3: Jika semua lolos, lakukan INSERT
+        # Kita perlu cursor standar (non-dictionary) untuk mendapatkan lastrowid
+        cursor.close() 
+        cursor = connection.cursor() 
+
         insert_query = "INSERT INTO users (nama, email, password) VALUES (%s, %s, %s)"
         cursor.execute(insert_query, (nama, email, hashed_password))
         connection.commit()
         new_id = cursor.lastrowid
+
     except Exception as e:
+        if connection:
+            connection.rollback() # Batalkan jika ada error
         return jsonify({"msg": f"Database error: {str(e)}"}), 500
     finally:
         if cursor:
@@ -139,7 +168,7 @@ def register():
             "email": email
         }), 201
 
-    return jsonify({"message": "Failed, can't register user"}), 501
+    return jsonify({"message": "Gagal mendaftarkan pengguna"}), 501
 
 
 # Di file auth_endpoints.py Anda

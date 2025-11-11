@@ -4,7 +4,7 @@ import os
 from flask import Blueprint, Response, json, jsonify, request
 from helper.db_helper import get_connection
 from helper.form_validation import get_form_data
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import get_jwt_identity, jwt_required
 from helper.year_operation import diff_year
 from helper.year_operation import check_age_book
 from werkzeug.utils import secure_filename
@@ -22,14 +22,276 @@ admin_endpoints = Blueprint("admin_endpoints", __name__)
 UPLOAD_FOLDER = "img"
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
 
+# pastikan folder ada
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
 
 
-# Helper untuk JSON
-# Helper untuk JSON
+@admin_endpoints.route('/non-fnb-transactions', methods=['GET'])
+# @jwt_required()
+def get_non_fnb_transactions():
+    start_date = request.args.get('startDate')
+    end_date = request.args.get('endDate')
+    if not start_date or not end_date:
+        return jsonify({"message": "ERROR", "error": "startDate and endDate are required"}), 400
+
+    connection = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # Query ini sama dengan query /transactions Anda,
+        # TAPI DENGAN TAMBAHAN "fnb.id_transaksi IS NULL" untuk memfilter
+        query = """
+            SELECT 
+                t.id_transaksi,
+                t.tanggal_transaksi,
+                COALESCE(u.nama, t.nama_guest, 'Guest') as name,
+                t.total_harga_final as total,
+                COALESCE(p.nilai_diskon, 0) as discount,
+                (t.total_harga_final + COALESCE(p.nilai_diskon, 0)) as subtotal,
+                CASE
+                    WHEN br.id_transaksi IS NOT NULL THEN CONCAT('Sewa Ruangan (', r.nama_ruangan, ')')
+                    WHEN be.id_transaksi IS NOT NULL THEN CONCAT('Sewa Event (', es.nama_event_space, ')')
+                    WHEN m.id_transaksi IS NOT NULL THEN 'Pembelian Membership'
+                    WHEN vo.id_transaksi IS NOT NULL THEN 'Pembelian Virtual Office'
+                    ELSE 'Lainnya (Non-F&B)'
+                END as category
+            FROM transaksi t
+            LEFT JOIN users u ON t.id_user = u.id_user
+            LEFT JOIN promo p ON t.id_promo = p.id_promo
+            
+            -- Join untuk filter F&B
+            LEFT JOIN (SELECT DISTINCT id_transaksi FROM detail_order_fnb) fnb ON t.id_transaksi = fnb.id_transaksi
+            
+            -- Join untuk kategori Non-F&B
+            LEFT JOIN booking_ruangan br ON t.id_transaksi = br.id_transaksi
+            LEFT JOIN ruangan r ON br.id_ruangan = r.id_ruangan
+            LEFT JOIN booking_event be ON t.id_transaksi = be.id_transaksi
+            LEFT JOIN event_spaces es ON be.id_event_space = es.id_event_space
+            LEFT JOIN memberships m ON t.id_transaksi = m.id_transaksi
+            LEFT JOIN client_virtual_office vo ON t.id_transaksi = vo.id_transaksi
+            WHERE 
+                DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+                AND t.status_pembayaran = 'Lunas'
+                AND fnb.id_transaksi IS NULL -- <-- INI FILTER UTAMANYA
+            ORDER BY t.tanggal_transaksi DESC;
+        """
+        
+        cursor.execute(query, (start_date, end_date))
+        transactions = cursor.fetchall()
+        
+        total_transaction_value = sum(item['total'] for item in transactions)
+
+        return jsonify({
+            "message": "OK",
+            "datas": {
+                "transactions": transactions,
+                "summary": {
+                    "totalTransaction": int(total_transaction_value)
+                }
+            }
+        })
+
+    except Exception as e:
+        print(f"Error in /admin/non-fnb-transactions: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if connection:
+            if cursor: cursor.close()
+            connection.close()
+
+
+@admin_endpoints.route('/fnb-sales-detail', methods=['GET'])
+# @jwt_required()
+def get_fnb_sales_detail():
+    start_date = request.args.get('startDate')
+    end_date = request.args.get('endDate')
+    if not start_date or not end_date:
+        return jsonify({"message": "ERROR", "error": "startDate and endDate are required"}), 400
+
+    connection = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        # Query ini mengambil setiap item F&B dan mengalokasikan pajak/diskon
+        query = """
+                WITH trans_details AS (
+                    SELECT
+                        t.id_transaksi, t.tanggal_transaksi, t.metode_pembayaran, t.pajak_nominal,
+                        COALESCE(p.nilai_diskon, 0) as diskon_transaksi,
+                        COALESCE(u.nama, t.nama_guest, 'Guest') as nama_pelanggan, -- Data sudah ada di sini
+                        (SELECT SUM(dof_inner.jumlah * dof_inner.harga_saat_order) 
+                        FROM detail_order_fnb dof_inner 
+                        WHERE dof_inner.id_transaksi = t.id_transaksi) AS subtotal_fnb_transaksi
+                    FROM transaksi t
+                    LEFT JOIN users u ON t.id_user = u.id_user
+                    LEFT JOIN promo p ON t.id_promo = p.id_promo
+                    WHERE t.status_pembayaran = 'Lunas'
+                    AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+                    AND EXISTS (SELECT 1 FROM detail_order_fnb dof_ex WHERE dof_ex.id_transaksi = t.id_transaksi)
+                )
+                SELECT 
+                    td.id_transaksi, td.tanggal_transaksi,
+                    td.nama_pelanggan, -- ✅ TAMBAHKAN BARIS INI
+                    tn.nama_tenant AS merchant, kp.nama_kategori AS category_product,
+                    pf.nama_produk AS product, dof.jumlah AS quantity,
+                    dof.harga_saat_order AS price,
+                    (dof.jumlah * dof.harga_saat_order) AS sub_total_item,
+                    CASE 
+                        WHEN td.subtotal_fnb_transaksi > 0 
+                        THEN (dof.jumlah * dof.harga_saat_order) / td.subtotal_fnb_transaksi * td.pajak_nominal
+                        ELSE 0 
+                    END AS tax_item,
+                    CASE 
+                        WHEN td.subtotal_fnb_transaksi > 0 
+                        THEN (dof.jumlah * dof.harga_saat_order) / td.subtotal_fnb_transaksi * td.diskon_transaksi
+                        ELSE 0 
+                    END AS discount_item,
+                    ( (dof.jumlah * dof.harga_saat_order) 
+                    + CASE WHEN td.subtotal_fnb_transaksi > 0 THEN (dof.jumlah * dof.harga_saat_order) / td.subtotal_fnb_transaksi * td.pajak_nominal ELSE 0 END
+                    - CASE WHEN td.subtotal_fnb_transaksi > 0 THEN (dof.jumlah * dof.harga_saat_order) / td.subtotal_fnb_transaksi * td.diskon_transaksi ELSE 0 END
+                    ) AS total_item,
+                    dof.catatan_pesanan AS note,
+                    td.metode_pembayaran AS payment
+                FROM detail_order_fnb dof
+                JOIN trans_details td ON dof.id_transaksi = td.id_transaksi
+                JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+                JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
+                JOIN tenants tn ON kp.id_tenant = tn.id_tenant
+                ORDER BY td.tanggal_transaksi DESC;
+        """
+        cursor.execute(query, (start_date, end_date))
+        items = cursor.fetchall()
+        
+        # Kirim kembali dalam format yang diharapkan
+        return jsonify({"message": "OK", "datas": items})
+
+    except Exception as e:
+        print(f"Error in /admin/fnb-sales-detail: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if connection:
+            if cursor: cursor.close()
+            connection.close()
+
+
+
 def decimal_default(obj):
     if isinstance(obj, decimal.Decimal):
         return float(obj)
-    raise TypeError
+    if isinstance(obj, (date, datetime)): # <-- TAMBAHKAN INI
+        return obj.isoformat() # Konversi tanggal/waktu ke string ISO (cth: '2025-11-07')
+    
+    # Tampilkan error yang lebih jelas jika ada tipe data lain
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+# === ENDPOINT BARU UNTUK EXPORT DETAIL ===
+@admin_endpoints.route('/export-bagi-hasil-detail', methods=['GET'])
+@jwt_required()
+def get_export_bagi_hasil_detail():
+    connection = None
+    try:
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
+
+        if not start_date_str or not end_date_str:
+            return jsonify({
+                "message": "ERROR",
+                "error": "Parameter 'start_date' dan 'end_date' diperlukan"
+            }), 400
+
+        # Pastikan end_date mencakup akhir hari
+        end_date_str_inclusive = f"{end_date_str} 23:59:59"
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. Ambil semua tenant aktif
+        cursor.execute("""
+            SELECT id_tenant, nama_tenant 
+            FROM tenants 
+            WHERE status_tenant = 'Active'
+        """)
+        tenants = cursor.fetchall()
+
+        export_data = {}
+
+        for tenant in tenants:
+            id_tenant = tenant['id_tenant']
+            tenant_name = tenant['nama_tenant']
+
+            # 2. Ambil Rincian Sales
+            query_sales_detail = """
+                SELECT 
+                    DATE(t.tanggal_transaksi) AS tanggal,
+                    pf.nama_produk,
+                    SUM(dof.jumlah) AS jumlah_qty,
+                    SUM(dof.harga_saat_order * dof.jumlah) AS total_penjualan_gross
+                FROM transaksi t
+                JOIN detail_order_fnb dof ON t.id_transaksi = dof.id_transaksi
+                JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+                JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
+                WHERE kp.id_tenant = %s
+                  AND t.status_pembayaran = 'Lunas'
+                  AND t.tanggal_transaksi BETWEEN %s AND %s
+                GROUP BY DATE(t.tanggal_transaksi), pf.nama_produk
+                ORDER BY tanggal, pf.nama_produk;
+            """
+            cursor.execute(query_sales_detail, (id_tenant, start_date_str, end_date_str_inclusive))
+            sales_details = cursor.fetchall()
+
+            # 3. Ambil Rincian Utang
+            query_debt_detail = """
+                SELECT 
+                    tanggal_utang,
+                    deskripsi,
+                    jumlah
+                FROM utang_tenant
+                WHERE id_tenant = %s
+                  AND status_lunas = 0
+                  AND tanggal_utang <= %s
+                ORDER BY tanggal_utang;
+            """
+            cursor.execute(query_debt_detail, (id_tenant, end_date_str))
+            debt_details = cursor.fetchall()
+
+            # Masukkan hasil ke export_data
+            export_data[tenant_name] = {
+                "sales": sales_details,
+                "debts": debt_details
+            }
+
+        # Gunakan json.dumps dengan helper decimal_default
+        response_body = json.dumps({
+            "message": "OK",
+            "datas": export_data
+        }, default=decimal_default)
+
+        return response_body, 200, {'Content-Type': 'application/json'}
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "message": "ERROR",
+            "error": str(e)
+        }), 500
+
+    finally:
+        if connection:
+            connection.close()
+
+# Helper untuk JSON
+# Helper untuk JSON
+# def decimal_default(obj):
+#     if isinstance(obj, decimal.Decimal):
+#         return float(obj)
+#     raise TypeError
 
 # === 1. ENDPOINT UTAMA (BARU): Laporan Live Berdasarkan Rentang Tanggal ===
 @admin_endpoints.route('/rekap-live', methods=['GET'])
@@ -316,9 +578,6 @@ def delete_utang_entry(id_utang):
 
 
 
-# pastikan folder ada
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
 
 # --- HELPER KALKULASI SALES ---
 def calculate_tenant_sales(cursor, id_tenant, start_date, end_date):
@@ -726,10 +985,10 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Helper untuk mengubah Decimal menjadi float untuk JSON
-def decimal_default(obj):
-    if isinstance(obj, decimal.Decimal):
-        return float(obj)
-    raise TypeError
+# def decimal_default(obj):
+#     if isinstance(obj, decimal.Decimal):
+#         return float(obj)
+#     raise TypeError
 
 # # --- ENDPOINT 1: GET DATA REKAP UNTUK HALAMAN HUTANG ---
 # # Ini menggabungkan Laporan Bagi Hasil (sales) dengan data utang/pembayaran
@@ -1503,6 +1762,7 @@ def get_transaction_history():
     
 
 @admin_endpoints.route('/costBulananRead', methods=['GET'])
+@jwt_required()
 def get_all_pengeluaran():
     connection = None
     cursor = None
@@ -1547,21 +1807,34 @@ def get_all_pengeluaran():
         
 
 # ✅ POST: Membuat data pengeluaran baru
-@admin_endpoints.route('costBulananCreate', methods=['POST'])
+@admin_endpoints.route('/costBulananCreate', methods=['POST'])
+@jwt_required()
 def create_pengeluaran():
     connection = None
     cursor = None
     try:
+        # --- PERBAIKAN DIMULAI DI SINI ---
+        
+        # 1. Dapatkan seluruh identity object (dictionary)
+        jwt_identity = get_jwt_identity()
+        
+        # 2. Ekstrak 'id_user' dari dictionary tersebut
+        try:
+            dicatat_oleh = jwt_identity.get('id_user')
+            if not dicatat_oleh:
+                return jsonify({"message": "ERROR", "error": "Format token tidak valid atau tidak berisi id_user"}), 401
+        except AttributeError:
+            # Fallback jika token HANYA berisi ID (bukan dict)
+            dicatat_oleh = jwt_identity
+            
+        # --- PERBAIKAN SELESAI ---
+
         data = request.get_json()
         tanggal = data.get('tanggal')
         kategori = data.get('kategori')
         deskripsi = data.get('deskripsi')
         jumlah = data.get('jumlah')
         
-        # Asumsi dicatat_oleh diambil dari data user yang login (misal dari token JWT)
-        # Untuk contoh ini kita set NULL
-        dicatat_oleh = None 
-
         if not all([tanggal, kategori, deskripsi, jumlah]):
             return jsonify({"message": "ERROR", "error": "Semua field wajib diisi"}), 400
 
@@ -1572,6 +1845,8 @@ def create_pengeluaran():
             (tanggal_pengeluaran, kategori, deskripsi, jumlah, dicatat_oleh) 
             VALUES (%s, %s, %s, %s, %s)
         """
+        
+        # 'dicatat_oleh' sekarang adalah integer (misal: 1), bukan dictionary
         cursor.execute(query, (tanggal, kategori, deskripsi, jumlah, dicatat_oleh))
         connection.commit()
 
@@ -1579,13 +1854,17 @@ def create_pengeluaran():
 
     except Exception as e:
         if connection: connection.rollback()
+        # Mengirimkan error yang lebih spesifik ke konsol untuk debugging
+        import traceback
+        traceback.print_exc() 
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-
+        
 # ✅ PUT: Memperbarui data pengeluaran berdasarkan ID
 @admin_endpoints.route('costBulananUpdate/<int:id_pengeluaran>', methods=['PUT'])
+@jwt_required()
 def update_pengeluaran(id_pengeluaran):
     connection = None
     cursor = None
@@ -1626,6 +1905,7 @@ def update_pengeluaran(id_pengeluaran):
 
 # ✅ DELETE: Menghapus data pengeluaran berdasarkan ID
 @admin_endpoints.route('costBulananDelete/<int:id_pengeluaran>', methods=['DELETE'])
+@jwt_required()
 def delete_pengeluaran(id_pengeluaran):
     connection = None
     cursor = None
