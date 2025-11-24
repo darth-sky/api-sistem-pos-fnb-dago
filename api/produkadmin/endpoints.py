@@ -264,15 +264,33 @@ def delete_produk(id_produk):
 
 
 
+# (Asumsi: get_connection, jsonify, dll. sudah di-import)
+
 @produkadmin_endpoints.route('/readKategoriTenant', methods=['GET'])
 def readKategori():
+    connection = None
+    cursor = None
     try:
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
+        
+        # --- PERBAIKAN: ---
+        # 1. Tambahkan LEFT JOIN ke chart_of_accounts
+        # 2. Tambahkan kolom id_coa, kode_akun, dan nama_akun ke SELECT
+        
         query = """
-        SELECT k.id_kategori, k.nama_kategori, t.id_tenant, t.nama_tenant
-        FROM kategori_produk k
-        JOIN tenants t ON k.id_tenant = t.id_tenant
+        SELECT 
+            k.id_kategori, k.nama_kategori, k.id_coa,
+            t.id_tenant, t.nama_tenant,
+            coa.kode_akun, coa.nama_akun
+        FROM 
+            kategori_produk k
+        JOIN 
+            tenants t ON k.id_tenant = t.id_tenant
+        LEFT JOIN 
+            chart_of_accounts coa ON k.id_coa = coa.id_coa
+        ORDER BY
+            t.nama_tenant, k.nama_kategori
         """
         cursor.execute(query)
         results = cursor.fetchall()
@@ -285,6 +303,7 @@ def readKategori():
 
 
 # ✅ CREATE kategori
+# ✅ CREATE kategori (SUDAH DIMODIFIKASI)
 @produkadmin_endpoints.route('/createKategori', methods=['POST'])
 def createKategori():
     connection = None
@@ -293,6 +312,9 @@ def createKategori():
         data = request.get_json()
         nama_kategori = data.get("nama_kategori")
         id_tenant = data.get("id_tenant")
+        # --- TAMBAHAN BARU ---
+        # Ambil id_coa, bisa jadi None jika tidak dipilih
+        id_coa = data.get("id_coa") 
 
         if not nama_kategori or not id_tenant:
             return jsonify({"message": "ERROR", "error": "nama_kategori dan id_tenant wajib diisi"}), 400
@@ -301,10 +323,11 @@ def createKategori():
         cursor = connection.cursor()
 
         insert_query = """
-        INSERT INTO kategori_produk (nama_kategori, id_tenant)
-        VALUES (%s, %s)
+        INSERT INTO kategori_produk (nama_kategori, id_tenant, id_coa)
+        VALUES (%s, %s, %s)
         """
-        cursor.execute(insert_query, (nama_kategori, id_tenant))
+        # --- MODIFIKASI: Tambahkan id_coa ke parameter ---
+        cursor.execute(insert_query, (nama_kategori, id_tenant, id_coa))
         connection.commit()
 
         return jsonify({"message": "Kategori berhasil ditambahkan"}), 201
@@ -315,8 +338,8 @@ def createKategori():
         if connection: connection.close()
 
 
-# ✅ UPDATE kategori
-@produkadmin_endpoints.route('/updateKategori/<id_kategori>', methods=['PUT'])
+# ✅ UPDATE kategori (SUDAH DIMODIFIKASI)
+@produkadmin_endpoints.route('/updateKategori/<int:id_kategori>', methods=['PUT'])
 def updateKategori(id_kategori):
     connection = None
     cursor = None
@@ -324,6 +347,8 @@ def updateKategori(id_kategori):
         data = request.get_json()
         nama_kategori = data.get("nama_kategori")
         id_tenant = data.get("id_tenant")
+        # --- TAMBAHAN BARU ---
+        id_coa = data.get("id_coa")
 
         if not nama_kategori or not id_tenant:
             return jsonify({"message": "ERROR", "error": "nama_kategori dan id_tenant wajib diisi"}), 400
@@ -333,10 +358,11 @@ def updateKategori(id_kategori):
 
         update_query = """
         UPDATE kategori_produk
-        SET nama_kategori = %s, id_tenant = %s
+        SET nama_kategori = %s, id_tenant = %s, id_coa = %s
         WHERE id_kategori = %s
         """
-        cursor.execute(update_query, (nama_kategori, id_tenant, id_kategori))
+        # --- MODIFIKASI: Tambahkan id_coa ke parameter ---
+        cursor.execute(update_query, (nama_kategori, id_tenant, id_coa, id_kategori))
         connection.commit()
 
         if cursor.rowcount == 0:
@@ -348,7 +374,7 @@ def updateKategori(id_kategori):
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-
+        
 
 # ✅ DELETE kategori
 @produkadmin_endpoints.route('/deleteKategori/<id_kategori>', methods=['DELETE'])

@@ -142,7 +142,7 @@ def delete_paket_vo(id_paket_vo):
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-        
+   
 
 
 # Ganti endpoint /getRequests Anda dengan ini

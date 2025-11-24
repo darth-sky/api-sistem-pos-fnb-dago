@@ -16,7 +16,7 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 EMAIL_SENDER = os.getenv("EMAIL_SENDER",
                          "dagocreativehub@gmail.com")  # email sistem pengirim
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD",
-                           "xhxs podr zrxk tlay")  # app password
+                           "hkpo exrp njck rfpi")  # app password
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL",
                         "mohamedizzykilian@gmail.com")  # email tujuan admin
 

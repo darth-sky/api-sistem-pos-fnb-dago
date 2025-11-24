@@ -166,17 +166,28 @@ def delete_ruangan(id_ruangan):
         if 'conn' in locals() and conn: conn.close()
 
 
+# ✅ READ kategori ruangan (SUDAH DIMODIFIKASI)
 @ruanganadmin_endpoints.route('/readKategori', methods=['GET'])
 def read_kategori_ruangan():
-    # Endpoint ini tidak perlu diubah, SELECT * sudah mengambil kolom status.
-    # Namun, untuk kejelasan, kita bisa menentukannya secara eksplisit.
     connection = None
     cursor = None
     try:
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
-        # Query lebih baik dibuat eksplisit
-        query = "SELECT id_kategori_ruangan, nama_kategori, deskripsi, gambar_kategori_ruangan, status FROM kategori_ruangan ORDER BY id_kategori_ruangan DESC"
+        
+        # --- MODIFIKASI: Tambahkan LEFT JOIN ke chart_of_accounts ---
+        query = """
+            SELECT 
+                kr.id_kategori_ruangan, kr.nama_kategori, kr.deskripsi, 
+                kr.gambar_kategori_ruangan, kr.status, kr.id_coa,
+                coa.kode_akun, coa.nama_akun
+            FROM 
+                kategori_ruangan kr
+            LEFT JOIN 
+                chart_of_accounts coa ON kr.id_coa = coa.id_coa
+            ORDER BY 
+                kr.id_kategori_ruangan DESC
+        """
         cursor.execute(query)
         results = cursor.fetchall()
         return jsonify({"message": "OK", "datas": results}), 200
@@ -186,35 +197,45 @@ def read_kategori_ruangan():
         if cursor: cursor.close()
         if connection: connection.close()
 
-# ✅ CREATE kategori ruangan (Diperbarui untuk FormData)
+# ✅ CREATE kategori ruangan (SUDAH DIMODIFIKASI)
 @ruanganadmin_endpoints.route('/createKategori', methods=['POST'])
 def create_kategori_ruangan():
     connection = None
     cursor = None
     try:
-        # Mengambil data dari form-data, bukan JSON
+        # Mengambil data dari form-data
         nama_kategori = request.form.get("nama_kategori")
         deskripsi = request.form.get("deskripsi")
         status = request.form.get("status", 'Active')
+        # --- TAMBAHAN BARU: Ambil id_coa dari form ---
+        id_coa = request.form.get("id_coa")
+        
+        # Konversi id_coa ke None jika string kosong
+        if id_coa == 'null' or id_coa == '':
+            id_coa = None
 
         if not nama_kategori:
             return jsonify({"message": "ERROR", "error": "nama_kategori wajib diisi"}), 400
 
-        # Logika untuk menangani file upload
         gambar_filename = None
         if 'gambar_kategori_ruangan' in request.files:
             file = request.files['gambar_kategori_ruangan']
             if file and file.filename != '':
                 filename = secure_filename(file.filename)
-                # Opsi: buat nama file unik untuk menghindari tumpukan
-                # unique_filename = str(uuid.uuid4()) + "_" + filename
+                # Anda mungkin perlu nama file unik di sini
                 file.save(os.path.join(UPLOAD_FOLDER, filename))
                 gambar_filename = filename
 
         connection = get_connection()
         cursor = connection.cursor()
-        query = "INSERT INTO kategori_ruangan (nama_kategori, deskripsi, status, gambar_kategori_ruangan) VALUES (%s, %s, %s, %s)"
-        cursor.execute(query, (nama_kategori, deskripsi, status, gambar_filename))
+        
+        # --- MODIFIKASI: Tambahkan id_coa ke query INSERT ---
+        query = """
+            INSERT INTO kategori_ruangan 
+            (nama_kategori, deskripsi, status, gambar_kategori_ruangan, id_coa) 
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(query, (nama_kategori, deskripsi, status, gambar_filename, id_coa))
         connection.commit()
 
         return jsonify({"message": "Kategori ruangan berhasil ditambahkan"}), 201
@@ -226,7 +247,7 @@ def create_kategori_ruangan():
         if connection: connection.close()
 
 
-# ✅ UPDATE kategori ruangan (Diperbarui untuk FormData)
+# ✅ UPDATE kategori ruangan (SUDAH DIMODIFIKASI)
 @ruanganadmin_endpoints.route('/updateKategori/<int:id_kategori>', methods=['PUT'])
 def update_kategori_ruangan(id_kategori):
     connection = None
@@ -235,6 +256,12 @@ def update_kategori_ruangan(id_kategori):
         nama_kategori = request.form.get("nama_kategori")
         deskripsi = request.form.get("deskripsi")
         status = request.form.get("status")
+        # --- TAMBAHAN BARU: Ambil id_coa dari form ---
+        id_coa = request.form.get("id_coa")
+        
+        # Konversi id_coa ke None jika string kosong
+        if id_coa == 'null' or id_coa == '':
+            id_coa = None
 
         if not nama_kategori or not status:
             return jsonify({"message": "ERROR", "error": "nama_kategori dan status wajib diisi"}), 400
@@ -242,7 +269,6 @@ def update_kategori_ruangan(id_kategori):
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
         
-        # Dapatkan nama file lama sebelum update
         cursor.execute("SELECT gambar_kategori_ruangan FROM kategori_ruangan WHERE id_kategori_ruangan = %s", (id_kategori,))
         existing_data = cursor.fetchone()
         if not existing_data:
@@ -250,11 +276,9 @@ def update_kategori_ruangan(id_kategori):
 
         gambar_filename = existing_data['gambar_kategori_ruangan']
 
-        # Cek jika ada file baru yang diupload
         if 'gambar_kategori_ruangan' in request.files:
             file = request.files['gambar_kategori_ruangan']
             if file and file.filename != '':
-                # Hapus file lama jika ada
                 if gambar_filename and os.path.exists(os.path.join(UPLOAD_FOLDER, gambar_filename)):
                     os.remove(os.path.join(UPLOAD_FOLDER, gambar_filename))
                 
@@ -262,14 +286,16 @@ def update_kategori_ruangan(id_kategori):
                 file.save(os.path.join(UPLOAD_FOLDER, filename))
                 gambar_filename = filename
         
-        # Lakukan update ke database
         update_cursor = connection.cursor()
+        
+        # --- MODIFIKASI: Tambahkan id_coa ke query UPDATE ---
         query = """
             UPDATE kategori_ruangan 
-            SET nama_kategori = %s, deskripsi = %s, status = %s, gambar_kategori_ruangan = %s
+            SET nama_kategori = %s, deskripsi = %s, status = %s, 
+                gambar_kategori_ruangan = %s, id_coa = %s
             WHERE id_kategori_ruangan = %s
         """
-        update_cursor.execute(query, (nama_kategori, deskripsi, status, gambar_filename, id_kategori))
+        update_cursor.execute(query, (nama_kategori, deskripsi, status, gambar_filename, id_coa, id_kategori))
         connection.commit()
         update_cursor.close()
 
@@ -280,7 +306,6 @@ def update_kategori_ruangan(id_kategori):
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-
 
 # @ruanganadmin_endpoints.route('/readKategori', methods=['GET'])
 # def read_kategori_ruangan():

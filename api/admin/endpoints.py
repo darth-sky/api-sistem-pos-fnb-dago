@@ -190,8 +190,8 @@ def decimal_default(obj):
     
     # Tampilkan error yang lebih jelas jika ada tipe data lain
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+# routes/admin_routes.py
 
-# === ENDPOINT BARU UNTUK EXPORT DETAIL ===
 @admin_endpoints.route('/export-bagi-hasil-detail', methods=['GET'])
 @jwt_required()
 def get_export_bagi_hasil_detail():
@@ -226,13 +226,28 @@ def get_export_bagi_hasil_detail():
             id_tenant = tenant['id_tenant']
             tenant_name = tenant['nama_tenant']
 
-            # 2. Ambil Rincian Sales
+            # 2. Ambil Rincian Sales (DENGAN TOTAL DISCOUNT)
+            # Perubahan ada di baris SELECT ke-5: menghitung diskon dari persentase
             query_sales_detail = """
                 SELECT 
                     DATE(t.tanggal_transaksi) AS tanggal,
                     pf.nama_produk,
                     SUM(dof.jumlah) AS jumlah_qty,
-                    SUM(dof.harga_saat_order * dof.jumlah) AS total_penjualan_gross
+                    
+                    -- Total Kotor (Gross)
+                    SUM(dof.harga_saat_order * dof.jumlah) AS total_penjualan_gross,
+                    
+                    -- Total Diskon
+                    SUM(
+                        (dof.harga_saat_order * dof.jumlah) * (COALESCE(t.discount_percentage, 0) / 100)
+                    ) AS total_discount,
+
+                    -- (BARU) Total Pajak
+                    -- Dihitung dari (Harga x Qty) dikali Persen Pajak Transaksi
+                    SUM(
+                        (dof.harga_saat_order * dof.jumlah) * (COALESCE(t.pajak_persen, 0) / 100)
+                    ) AS total_pajak
+
                 FROM transaksi t
                 JOIN detail_order_fnb dof ON t.id_transaksi = dof.id_transaksi
                 JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
@@ -246,7 +261,7 @@ def get_export_bagi_hasil_detail():
             cursor.execute(query_sales_detail, (id_tenant, start_date_str, end_date_str_inclusive))
             sales_details = cursor.fetchall()
 
-            # 3. Ambil Rincian Utang
+            # 3. Ambil Rincian Utang (Tidak berubah)
             query_debt_detail = """
                 SELECT 
                     tanggal_utang,
@@ -276,6 +291,7 @@ def get_export_bagi_hasil_detail():
         return response_body, 200, {'Content-Type': 'application/json'}
 
     except Exception as e:
+        import traceback
         traceback.print_exc()
         return jsonify({
             "message": "ERROR",
@@ -285,7 +301,7 @@ def get_export_bagi_hasil_detail():
     finally:
         if connection:
             connection.close()
-
+            
 # Helper untuk JSON
 # Helper untuk JSON
 # def decimal_default(obj):
@@ -443,6 +459,7 @@ def get_active_tenants():
     finally:
         if connection:
             connection.close()
+
 
 @admin_endpoints.route('/utang-log', methods=['GET'])
 def get_utang_log():

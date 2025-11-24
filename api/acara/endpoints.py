@@ -365,3 +365,5 @@ def get_semua_acara():
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
+        
+        

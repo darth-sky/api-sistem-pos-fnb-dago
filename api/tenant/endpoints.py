@@ -154,10 +154,16 @@ def update_produk_status(id_produk):
 def get_orders_by_tenant(id_tenant):
     connection = None
     try:
+        # --- PERUBAHAN 1: Ambil sesi_id dari query param ---
+        sesi_id = request.args.get('sesi_id')
+        if not sesi_id:
+            return jsonify({"message": "ERROR", "error": "Missing 'sesi_id' query parameter"}), 400
+        # --- AKHIR PERUBAHAN 1 ---
+
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # SOLUSI: Satu query untuk mengambil semua data yang dibutuhkan
+        # --- PERUBAHAN 2: Tambahkan t.id_sesi ke query ---
         query = """
             SELECT 
                 t.id_transaksi,
@@ -178,23 +184,25 @@ def get_orders_by_tenant(id_tenant):
             LEFT JOIN users u ON t.id_user = u.id_user
             WHERE 
                 kp.id_tenant = %s AND
+                t.id_sesi = %s AND  -- <-- FILTER SESI DITAMBAHKAN DI SINI
                 t.status_pembayaran = 'Lunas' AND
-                dof.status_pesanan IN ('Baru', 'Diproses', 'Selesai', 'Batal') -- <-- FIX 1: Memfilter hanya pesanan aktif
+                -- Filter status pesanan yang logis untuk "Dashboard Aktif"
+                dof.status_pesanan IN ('Baru', 'Diproses') 
             ORDER BY t.tanggal_transaksi DESC;
         """
-        cursor.execute(query, (id_tenant,))
+        # --- AKHIR PERUBAHAN 2 ---
+
+        # --- PERUBAHAN 3: Tambahkan sesi_id ke parameter execute ---
+        cursor.execute(query, (id_tenant, sesi_id))
+        # --- AKHIR PERUBAHAN 3 ---
+        
         results = cursor.fetchall()
         
-        # SOLUSI: Mengelompokkan data di Python, bukan dengan N+1 query
+        # ... (Sisa logika pengelompokan data Anda sudah benar) ...
         orders_dict = {}
         for row in results:
             order_id = row['id_transaksi']
             if order_id not in orders_dict:
-                # FIX 3: Mapping status DB ('Baru') ke status UI ('NEW')
-                # status_ui = "NEW"
-                # if row['status_pesanan'] == 'Diproses':
-                #     status_ui = "ON PROSES"
-
                 orders_dict[order_id] = {
                     "id": order_id,
                     "id_detail_order": row['id_detail_order'],
@@ -223,7 +231,7 @@ def get_orders_by_tenant(id_tenant):
         if connection and connection.is_connected():
             cursor.close()
             connection.close()
-
+            
 
 
 @tenant_endpoints.route("/readOrderTenant/<int:id_tenant>", methods=["GET"])
