@@ -17,87 +17,78 @@ UPLOAD_FOLDER = "img"
 
 @tenant_endpoints.route('/orders/transaksi/<int:id_transaksi>/status', methods=['PUT'])
 def update_transaction_status_by_tenant(id_transaksi):
-    """
-    Endpoint untuk mengupdate status SEMUA item milik tenant 
-    dalam satu transaksi.
-    Menerima JSON body: { "status": "NAMA_STATUS_UI", "tenant_id": ID_TENANT_ANDA }
-    """
     data = request.get_json()
-    print("📥 Data diterima:", data)
     if not data or 'status' not in data or 'tenant_id' not in data:
-        return jsonify({"message": "ERROR", "error": "Missing 'status' or 'tenant_id' in request body"}), 400
+        return jsonify({"message": "ERROR", "error": "Missing data"}), 400
 
     new_status_ui = data['status']
     id_tenant = data['tenant_id']
     
-    # Mapping dari status UI ke status Database
     status_map = {
         "ON PROSES": "Diproses",
         "FINISH": "Selesai",
-        "NEW": "Baru"
+        "NEW": "Baru" # Opsional, jarang dipakai update ke Baru
     }
     
     db_status = status_map.get(new_status_ui)
-    
     if not db_status:
-         return jsonify({"message": "ERROR", "error": f"Invalid status value: {new_status_ui}"}), 400
+         return jsonify({"message": "ERROR", "error": "Invalid status"}), 400
 
     connection = None
     try:
         connection = get_connection()
         cursor = connection.cursor()
 
-        # Tentukan status asal (status_lama) berdasarkan status baru (db_status)
-        status_asal = None
+        # --- PERBAIKAN LOGIKA: Penentuan Status Asal yang Valid ---
+        valid_origins = []
+        
         if db_status == "Diproses":
-            status_asal = "Baru"
+            # Hanya boleh dari Baru
+            valid_origins = ["Baru"]
         elif db_status == "Selesai":
-            status_asal = "Diproses"
+            # Boleh dari Baru ATAU Diproses (Lebih Fleksibel)
+            valid_origins = ["Baru", "Diproses"]
+        
+        if not valid_origins:
+             return jsonify({"message": "ERROR", "error": "Invalid transition"}), 400
 
-        if status_asal is None:
-             return jsonify({"message": "ERROR", "error": f"Invalid state transition to {db_status}"}), 400
+        # Buat string placeholder dinamis untuk IN clause (contoh: "%s, %s")
+        placeholders = ', '.join(['%s'] * len(valid_origins))
 
-        # === 1. 👈 PERBAIKAN UTAMA: Query diubah ===
-        # Query ini mengganti "UPDATE...JOIN" dengan "UPDATE...WHERE...IN"
-        # Ini jauh lebih stabil untuk konektor mysql-python.
-        query_aman = """
+        query_aman = f"""
             UPDATE detail_order_fnb
             SET 
-                status_pesanan = %s  -- 1. status_baru (misal: "Diproses")
+                status_pesanan = %s
             WHERE 
-                id_transaksi = %s AND -- 2. id_transaksi (misal: 356)
-                status_pesanan = %s AND -- 3. status_lama (misal: "Baru")
+                id_transaksi = %s AND
+                status_pesanan IN ({placeholders}) AND -- Menggunakan IN untuk banyak status
                 id_produk IN (
-                    -- Subquery untuk menemukan semua produk milik tenant ini
                     SELECT p.id_produk
                     FROM produk_fnb p
                     JOIN kategori_produk kp ON p.id_kategori = kp.id_kategori
-                    WHERE kp.id_tenant = %s -- 4. id_tenant (misal: 3)
+                    WHERE kp.id_tenant = %s
                 );
         """
         
-        # === 2. 👈 PERBAIKAN: Urutan parameter disesuaikan dengan query baru ===
-        params = (db_status, id_transaksi, status_asal, id_tenant)
+        # Susun parameter urut: [status_baru, id_transaksi, ...status_asal..., id_tenant]
+        params = [db_status, id_transaksi] + valid_origins + [id_tenant]
 
         cursor.execute(query_aman, params)
         connection.commit()
 
         return jsonify({
-            "message": f"Order {id_transaksi} updated successfully for tenant {id_tenant}",
+            "message": "Update success",
             "rows_affected": cursor.rowcount
         }), 200
 
     except Exception as e:
-        # 3. 👈 PERBAIKAN: Debugging dan rollback tetap dipertahankan
         print(f"❌ DATABASE ERROR: {e}") 
-        if connection:
-            connection.rollback()
+        if connection: connection.rollback()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if connection and connection.is_connected():
             cursor.close()
-            connection.close()
-            
+            connection.close()            
             
 
 @tenant_endpoints.route("/updateProdukStatus/<int:id_produk>", methods=["PUT"])
@@ -187,7 +178,7 @@ def get_orders_by_tenant(id_tenant):
                 t.id_sesi = %s AND  -- <-- FILTER SESI DITAMBAHKAN DI SINI
                 t.status_pembayaran = 'Lunas' AND
                 -- Filter status pesanan yang logis untuk "Dashboard Aktif"
-                dof.status_pesanan IN ('Baru', 'Diproses') 
+                dof.status_pesanan IN ('Baru', 'Diproses', 'Selesai') 
             ORDER BY t.tanggal_transaksi DESC;
         """
         # --- AKHIR PERUBAHAN 2 ---

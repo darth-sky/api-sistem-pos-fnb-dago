@@ -8,6 +8,7 @@ instance/
 
 # Environment variables file
 .env
+.env.dev
 
 # IDE files
 .vscode/

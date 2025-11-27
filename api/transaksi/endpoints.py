@@ -39,7 +39,7 @@ def get_riwayat_transaksi():
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # === SOLUSI: Menggunakan GROUP_CONCAT untuk membuat string berformat JSON ===
+        # QUERY LENGKAP (JANGAN DISINGKAT)
         query = """
         SELECT 
             t.id_transaksi,
@@ -49,20 +49,23 @@ def get_riwayat_transaksi():
             t.status_pembayaran,
             t.status_order,
             
-            -- Booking Ruangan: Buat string yang meniru array of objects
+            -- 1. Booking Ruangan (Dengan gambar_ruangan)
             (SELECT CONCAT('[', 
                 GROUP_CONCAT(
                     JSON_OBJECT(
                         'nama_ruangan', r.nama_ruangan,
+                        'gambar_ruangan', r.gambar_ruangan,
                         'waktu_mulai', br.waktu_mulai,
                         'waktu_selesai', br.waktu_selesai,
                         'durasi', br.durasi
                     )
                 ), 
             ']')
-            FROM booking_ruangan br JOIN ruangan r ON br.id_ruangan = r.id_ruangan WHERE br.id_transaksi = t.id_transaksi) AS bookings,
+            FROM booking_ruangan br 
+            JOIN ruangan r ON br.id_ruangan = r.id_ruangan 
+            WHERE br.id_transaksi = t.id_transaksi) AS bookings,
 
-            -- Lakukan hal yang sama untuk item lainnya
+            -- 2. Memberships (WAJIB ADA agar tidak error KeyError)
             (SELECT CONCAT('[', 
                 GROUP_CONCAT(
                     JSON_OBJECT(
@@ -72,8 +75,11 @@ def get_riwayat_transaksi():
                     )
                 ), 
             ']')
-            FROM memberships m JOIN paket_membership pm ON m.id_paket_membership = pm.id_paket_membership WHERE m.id_transaksi = t.id_transaksi) AS memberships,
+            FROM memberships m 
+            JOIN paket_membership pm ON m.id_paket_membership = pm.id_paket_membership 
+            WHERE m.id_transaksi = t.id_transaksi) AS memberships,
             
+            -- 3. Virtual Offices (WAJIB ADA)
             (SELECT CONCAT('[',
                 GROUP_CONCAT(
                     JSON_OBJECT(
@@ -84,36 +90,54 @@ def get_riwayat_transaksi():
                     )
                 ),
             ']')
-            FROM client_virtual_office vo JOIN paket_virtual_office pvo ON vo.id_paket_vo = pvo.id_paket_vo WHERE vo.id_transaksi = t.id_transaksi) AS virtual_offices,
+            FROM client_virtual_office vo 
+            JOIN paket_virtual_office pvo ON vo.id_paket_vo = pvo.id_paket_vo 
+            WHERE vo.id_transaksi = t.id_transaksi) AS virtual_offices,
 
+            -- 4. Events (Dengan gambar_ruangan jika ada di tabel event_spaces)
             (SELECT CONCAT('[',
                 GROUP_CONCAT(
                     JSON_OBJECT(
                         'nama_event', bes.nama_acara,
                         'nama_space', es.nama_event_space,
+                        'gambar_ruangan', es.gambar_ruangan, 
                         'tanggal_event', bes.tanggal_event,
-                        'waktu_mulai', bes.waktu_mulai,      -- <-- TAMBAHKAN INI
-                        'waktu_selesai', bes.waktu_selesai   -- <-- TAMBAHKAN INI
+                        'waktu_mulai', bes.waktu_mulai,
+                        'waktu_selesai', bes.waktu_selesai
                     )
                 ),
             ']')
-            FROM booking_event bes JOIN event_spaces es ON bes.id_event_space = es.id_event_space WHERE bes.id_transaksi = t.id_transaksi) AS events
+            FROM booking_event bes 
+            JOIN event_spaces es ON bes.id_event_space = es.id_event_space 
+            WHERE bes.id_transaksi = t.id_transaksi) AS events
         
         FROM transaksi t
         WHERE t.id_user = %s
         GROUP BY t.id_transaksi
         ORDER BY t.tanggal_transaksi DESC
         """
+        
         cursor.execute(query, (user_id,))
         results = cursor.fetchall()
         
-        # Logika parsing di Python tetap sama
+        # Parsing JSON string dari database ke objek Python
         import json
         for row in results:
-            if row['bookings']: row['bookings'] = json.loads(row['bookings'])
-            if row['memberships']: row['memberships'] = json.loads(row['memberships'])
-            if row['virtual_offices']: row['virtual_offices'] = json.loads(row['virtual_offices'])
-            if row['events']: row['events'] = json.loads(row['events'])
+            if row['bookings']: 
+                try: row['bookings'] = json.loads(row['bookings'])
+                except: row['bookings'] = []
+            
+            if row['memberships']: 
+                try: row['memberships'] = json.loads(row['memberships'])
+                except: row['memberships'] = []
+                
+            if row['virtual_offices']: 
+                try: row['virtual_offices'] = json.loads(row['virtual_offices'])
+                except: row['virtual_offices'] = []
+                
+            if row['events']: 
+                try: row['events'] = json.loads(row['events'])
+                except: row['events'] = []
 
         return jsonify({
             "message": "OK",
@@ -121,12 +145,13 @@ def get_riwayat_transaksi():
         }), 200
 
     except Exception as e:
+        import traceback
+        traceback.print_exc() # Print error lengkap ke terminal backend
         return jsonify({"error": str(e)}), 500
 
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
         if 'connection' in locals() and connection: connection.close()
-
 
 # @transaksi_endpoints.route('/riwayat', methods=['GET'])
 # @jwt_required()
