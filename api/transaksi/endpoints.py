@@ -3,6 +3,7 @@ import decimal
 import json
 import os
 from flask import Blueprint, jsonify, request
+from api.utils.ipaymu_helper import create_ipaymu_payment
 from helper.db_helper import get_connection
 from helper.form_validation import get_form_data
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -584,6 +585,61 @@ def get_fnb_tax_rate():
         print(f"Error getting FNB tax rate: {str(e)}")
         # Kembalikan default jika error, tapi log errornya
         return jsonify({"message": "ERROR", "error": str(e), "taxRate": 10.0}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()
+        
+
+@transaksi_endpoints.route('/repay/<int:id_transaksi>', methods=['GET'])
+@jwt_required()
+def get_repayment_link(id_transaksi):
+    """
+    Mengambil ulang URL pembayaran iPaymu untuk transaksi APAPUN yang belum lunas.
+    """
+    connection = None
+    cursor = None
+    try:
+        identity = get_jwt_identity()
+        user_id = identity.get("id_user")
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. Ambil detail transaksi (Pastikan milik user yang login)
+        cursor.execute("""
+            SELECT t.total_harga_final, t.status_pembayaran, 
+                   u.nama, u.email, u.no_telepon
+            FROM transaksi t
+            JOIN users u ON t.id_user = u.id_user
+            WHERE t.id_transaksi = %s AND t.id_user = %s
+        """, (id_transaksi, user_id))
+        trx = cursor.fetchone()
+
+        if not trx:
+            return jsonify({"message": "Transaksi tidak ditemukan atau akses ditolak"}), 404
+        
+        if trx['status_pembayaran'] == 'Lunas':
+            return jsonify({"message": "Transaksi sudah lunas"}), 400
+
+        # 2. Request Link Baru ke iPaymu
+        ipaymu_res = create_ipaymu_payment(
+            id_transaksi=id_transaksi,
+            amount=trx['total_harga_final'],
+            buyer_name=trx['nama'] or "Guest",
+            buyer_phone=trx['no_telepon'] or "08123456789",
+            buyer_email=trx['email'] or "guest@dago.com"
+        )
+
+        if ipaymu_res['success']:
+            return jsonify({
+                "message": "OK",
+                "payment_url": ipaymu_res['url']
+            }), 200
+        else:
+            return jsonify({"message": "ERROR", "error": ipaymu_res.get('message')}), 500
+
+    except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
         if connection: connection.close()

@@ -31,6 +31,7 @@ from api.admin.endpoints import admin_endpoints
 from api.acara.endpoints import acara_endpoints
 from api.coadmin.endpoints import coaadmin_endpoints
 from api.faq.endpoints import faq_endpoints
+from api.callback.endpoints import callback_endpoints
 
 from config import Config
 from static.static_file_server import static_file_server
@@ -77,6 +78,7 @@ app.register_blueprint(doc_file_server)
 app.register_blueprint(acara_endpoints, url_prefix='/api/v1/acara')
 app.register_blueprint(coaadmin_endpoints, url_prefix='/api/v1/coaadmin')
 app.register_blueprint(faq_endpoints, url_prefix='/api/v1/faq')
+app.register_blueprint(callback_endpoints, url_prefix='/api/callback')
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', debug=True, port=5000)

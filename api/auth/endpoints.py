@@ -209,4 +209,3 @@ def profile():
         # --- TAMBAHKAN 'is_first_login' DARI HASIL QUERY DB ---
         "is_first_login": user.get('is_first_login')
     })
-    

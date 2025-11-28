@@ -3,6 +3,7 @@ import os
 import sys
 from flask import Blueprint, jsonify, request
 import pytz
+from api.utils.ipaymu_helper import create_ipaymu_payment
 from helper.db_helper import get_connection
 from helper.form_validation import get_form_data
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -67,10 +68,11 @@ def get_private_office_rooms():
 
 @ruangan_endpoints.route('/bookRuanganBulk', methods=['POST'])
 @jwt_required()
-def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
+def book_ruangan_bulk_revised(): 
     """
     Membuat transaksi & booking untuk BANYAK ruangan sekaligus,
     dengan MEMECAH menjadi booking harian (tanpa timezone).
+    Mendukung integrasi iPaymu.
     """
     connection = None
     cursor = None
@@ -78,17 +80,15 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
         data = request.json
         identity = get_jwt_identity()
 
-        # --- Proses ID User (Tetap Sama) ---
+        # --- Proses ID User ---
         try:
             if isinstance(identity, dict):
-                 id_user = identity.get('id_user')
-                 if id_user is None: raise ValueError("Key 'id_user' missing.")
+                id_user = identity.get('id_user')
+                if id_user is None: raise ValueError("Key 'id_user' missing.")
             else: id_user = identity
-            # id_user = int(id_user) # Opsional
         except (TypeError, ValueError, AttributeError) as e:
             return jsonify({"message": "ERROR", "error": f"Invalid token identity: {e}"}), 400
         if id_user is None: return jsonify({"message": "ERROR", "error": "User ID missing."}), 400
-        # --- End Proses ID User ---
 
         # --- Ambil Data Format BARU dari Frontend ---
         room_ids = data.get("room_ids")
@@ -96,11 +96,11 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
         tanggal_selesai_str = data.get("tanggal_selesai")
         jam_mulai_int = data.get("jam_mulai")
         jam_selesai_int = data.get("jam_selesai")
-        metode_pembayaran = data.get("metode_pembayaran", "Non-Tunai")
-        status_pembayaran = data.get("status_pembayaran", "Lunas")
         
-        booking_source = data.get("booking_source", "PrivateOffice") # Default 'PrivateOffice'
+        # Default metode pembayaran
+        metode_pembayaran = data.get("metode_pembayaran", "Non-Tunai") 
         
+        booking_source = data.get("booking_source", "PrivateOffice") 
         include_saturday = data.get("include_saturday", False)
         include_sunday = data.get("include_sunday", False)
 
@@ -117,74 +117,67 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
                 raise ValueError("Tanggal selesai tidak boleh sebelum tanggal mulai.")
         except ValueError as e:
              return jsonify({"message": "ERROR", "error": f"Format tanggal salah: {e}"}), 400
-        # --- End Ambil Data ---
-
-
+        
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
         connection.start_transaction()
 
         total_harga_transaksi = 0
-        parsed_bookings_daily = [] # List untuk menampung booking harian
+        parsed_bookings_daily = [] 
 
-        # Ambil detail harga semua ruangan yang relevan sekali saja
+        # Ambil detail harga semua ruangan
         placeholders = ','.join(['%s'] * len(room_ids))
         cursor.execute(f"SELECT id_ruangan, nama_ruangan, harga_per_jam FROM ruangan WHERE id_ruangan IN ({placeholders})", tuple(room_ids))
         room_details = {room['id_ruangan']: room for room in cursor.fetchall()}
 
-        if len(room_details) != len(set(room_ids)): # Pastikan semua ID valid
+        if len(room_details) != len(set(room_ids)):
              missing_ids = set(room_ids) - set(room_details.keys())
              raise ValueError(f"Satu atau lebih ID ruangan tidak ditemukan: {missing_ids}")
 
         # --- TAHAP 1: VALIDASI PER HARI & KALKULASI HARGA ---
         current_date_check = tanggal_mulai_date
         while current_date_check <= tanggal_selesai_date:
-            # 👇 --- TAMBAHKAN BLOK LOGIKA INI --- 👇
-            # Cek hari apa ini. weekday() -> Senin=0, ..., Sabtu=5, Minggu=6
+            # Cek hari libur (Sabtu/Minggu)
             day_of_week = current_date_check.weekday() 
-            
-            # Jika hari ini Sabtu (5) DAN checkbox 'include_saturday' tidak dicentang
             if day_of_week == 5 and not include_saturday:
-                current_date_check += timedelta(days=1) # Pindah ke hari berikutnya
-                continue # Skip sisa loop, lanjut ke iterasi berikutnya (Minggu)
-
-            # Jika hari ini Minggu (6) DAN checkbox 'include_sunday' tidak dicentang
+                current_date_check += timedelta(days=1)
+                continue
             if day_of_week == 6 and not include_sunday:
-                current_date_check += timedelta(days=1) # Pindah ke hari berikutnya
-                continue # Skip sisa loop, lanjut ke iterasi berikutnya (Senin)
-            
+                current_date_check += timedelta(days=1)
+                continue
             
             waktu_mulai_dt = datetime.combine(current_date_check, datetime.min.time()).replace(hour=jam_mulai_int)
-            # Penting: Jika jam selesai adalah 0 (tengah malam), itu berarti akhir hari SEBELUMNYA.
-            # Namun, karena inputnya jam (misal 17), kita tetap di hari yang sama.
             waktu_selesai_dt = datetime.combine(current_date_check, datetime.min.time()).replace(hour=jam_selesai_int)
 
-            # Jika waktu selesai melintasi tengah malam (misal 22:00 - 02:00), perlu penyesuaian
-            # Untuk kasus 08:00 - 17:00, ini tidak relevan, tapi baik untuk kasus lain.
+            # Penyesuaian lintas hari (jika ada)
             if waktu_selesai_dt <= waktu_mulai_dt:
-                 # Jika waktu selesai <= waktu mulai, anggap selesai di HARI BERIKUTNYA
                  waktu_selesai_dt += timedelta(days=1)
-                 # Tapi jika input tanggal selesai == tanggal mulai, ini tidak valid
-                 if tanggal_selesai_date == tanggal_mulai_date and len(room_ids) * (tanggal_selesai_date - tanggal_mulai_date + timedelta(days=1)).days == 1 : # Hanya satu hari booking
+                 if tanggal_selesai_date == tanggal_mulai_date and len(room_ids) * (tanggal_selesai_date - tanggal_mulai_date + timedelta(days=1)).days == 1 :
                       raise ValueError("Untuk booking satu hari, jam selesai harus setelah jam mulai di hari yang sama.")
-                 # Jika multi-hari, dan ini adalah hari terakhir, jangan tambahkan hari di waktu selesai
                  elif current_date_check == tanggal_selesai_date:
-                      waktu_selesai_dt -= timedelta(days=1) # Kembalikan ke hari ini, asumsi maks jam 23:59 atau sesuai aturan bisnis
+                      waktu_selesai_dt -= timedelta(days=1) 
 
-            # --- Konversi ke string format DB untuk query ---
             waktu_mulai_db_str = waktu_mulai_dt.strftime('%Y-%m-%d %H:%M:%S')
             waktu_selesai_db_str = waktu_selesai_dt.strftime('%Y-%m-%d %H:%M:%S')
 
             for room_id in room_ids:
-                # Validasi ketersediaan untuk HARI INI, RUANGAN INI
-                check_query = "SELECT id_booking FROM booking_ruangan WHERE id_ruangan = %s AND (waktu_mulai < %s AND waktu_selesai > %s)"
+                # --- PERBAIKAN VALIDASI KETERSEDIAAN (Hanya blokir yg Lunas) ---
+                check_query = """
+                    SELECT br.id_booking 
+                    FROM booking_ruangan br
+                    JOIN transaksi t ON br.id_transaksi = t.id_transaksi
+                    WHERE br.id_ruangan = %s 
+                      AND (br.waktu_mulai < %s AND br.waktu_selesai > %s)
+                      AND t.status_pembayaran = 'Lunas'
+                """
                 cursor.execute(check_query, (room_id, waktu_selesai_db_str, waktu_mulai_db_str))
+                
                 if cursor.fetchone():
                     connection.rollback()
                     room_name = room_details.get(room_id, {}).get('nama_ruangan', f'ID {room_id}')
                     return jsonify({"message": "ERROR", "error": f"Slot untuk {room_name} pada {current_date_check.strftime('%d-%m-%Y')} jam {jam_mulai_int}:00 - {jam_selesai_int}:00 sudah terisi."}), 409
 
-                # Kalkulasi durasi & harga untuk HARI INI
+                # Kalkulasi durasi & harga
                 room_info = room_details[room_id]
                 harga_per_jam = room_info['harga_per_jam']
                 if harga_per_jam is None: raise ValueError(f"Harga per jam untuk {room_info['nama_ruangan']} tidak valid.")
@@ -197,7 +190,6 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
                 harga_booking_hari_ini = durasi_jam_hitung_hari_ini * harga_per_jam
                 total_harga_transaksi += harga_booking_hari_ini
 
-                # Tambahkan ke list booking harian
                 parsed_bookings_daily.append({
                     "id_ruangan": room_id,
                     "waktu_mulai_str": waktu_mulai_db_str,
@@ -205,15 +197,27 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
                     "durasi_menit": durasi_menit_simpan_hari_ini
                 })
 
-            current_date_check += timedelta(days=1) # Pindah ke hari berikutnya
+            current_date_check += timedelta(days=1)
 
-        # --- TAHAP 2: BUAT 1 TRANSAKSI INDUK ---
+        # --- TAHAP 2: BUAT 1 TRANSAKSI INDUK (Status Awal: Belum Lunas) ---
         insert_transaksi = """
-        INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order, booking_source)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order, booking_source, tanggal_transaksi)
+        VALUES (%s, %s, %s, %s, %s, %s, NOW())
         """
-        status_order = "Baru"
-        cursor.execute(insert_transaksi, (id_user, int(round(total_harga_transaksi)), metode_pembayaran, status_pembayaran, status_order, booking_source))
+        total_final = int(round(total_harga_transaksi))
+        
+        # Set default untuk iPaymu
+        metode_bayar_db = 'Ipaymu'
+        status_bayar_db = 'Belum Lunas'
+        
+        cursor.execute(insert_transaksi, (
+            id_user, 
+            total_final, 
+            metode_bayar_db, 
+            status_bayar_db, 
+            "Baru", 
+            booking_source
+        ))
         id_transaksi_baru = cursor.lastrowid
 
         # --- TAHAP 3: MASUKKAN SEMUA BOOKING HARIAN ---
@@ -225,24 +229,46 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
             cursor.execute(insert_booking_query, (
                 id_transaksi_baru,
                 b['id_ruangan'],
-                b['waktu_mulai_str'], # Kirim string
-                b['waktu_selesai_str'],# Kirim string
+                b['waktu_mulai_str'],
+                b['waktu_selesai_str'],
                 b['durasi_menit']
             ))
 
-        # Jika semua berhasil, commit
-        connection.commit()
+        # --- TAHAP 4: REQUEST LINK IPAYMU ---
+        # Ambil data user
+        cursor.execute("SELECT nama, email, no_telepon FROM users WHERE id_user = %s", (id_user,))
+        user_data = cursor.fetchone()
+        
+        buyer_name = user_data['nama'] if user_data else "Guest Bulk"
+        buyer_email = user_data['email'] if user_data else "guest@dago.com"
+        buyer_phone = user_data['no_telepon'] or "08123456789"
+
+        ipaymu_res = create_ipaymu_payment(
+            id_transaksi=id_transaksi_baru,
+            amount=total_final,
+            buyer_name=buyer_name,
+            buyer_phone=buyer_phone,
+            buyer_email=buyer_email
+        )
+
+        payment_url = None
+        if ipaymu_res['success']:
+            payment_url = ipaymu_res['url']
+            connection.commit() # Commit jika sukses dapat link
+        else:
+            connection.rollback() # Batal simpan jika gagal konek payment gateway
+            return jsonify({"message": "ERROR", "error": f"Gagal generate link pembayaran: {ipaymu_res.get('message')}"}), 500
 
         return jsonify({
-            "message": f"Pesanan bulk booking untuk {len(room_ids)} ruangan selama {(tanggal_selesai_date - tanggal_mulai_date).days + 1} hari berhasil dibuat.",
+            "message": f"Pesanan bulk booking berhasil dibuat. Silakan lakukan pembayaran.",
             "id_transaksi": id_transaksi_baru,
-            "total_harga": int(round(total_harga_transaksi))
+            "total_harga": total_final,
+            "payment_url": payment_url 
         }), 201
 
     except ValueError as ve:
         if connection: connection.rollback()
         print(f"Validation Error: {ve}")
-        traceback.print_exc()
         return jsonify({"message": "ERROR", "error": str(ve)}), 400
     except Exception as e:
         if connection: connection.rollback()
@@ -252,7 +278,6 @@ def book_ruangan_bulk_revised(): # Ganti nama fungsi jika perlu
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-
 
 
 
@@ -1427,45 +1452,51 @@ def create_booking():
 from datetime import datetime, timedelta # Pastikan ini diimport
 
 @ruangan_endpoints.route('/bookRuangan', methods=['POST'])
-# @jwt_required() # Pastikan endpoint ini aman
+@jwt_required() # Uncomment ini agar aman!
 def book_ruangan():
     """
     Buat transaksi & booking untuk ruangan.
-    Mendukung multi-hari, pembayaran kredit membership, dan benefit virtual office.
+    Mendukung multi-hari, pembayaran kredit membership, benefit virtual office, dan iPaymu.
     """
     connection = None
     cursor = None
     try:
         data = request.json
         
-        # --- Ambil semua data dari payload ---
+        # --- 1. Ambil & Validasi Data Payload ---
         id_user = data.get("id_user")
-        id_ruangan = data["id_ruangan"]
-        tanggal_mulai_str = data["tanggal_mulai"]
-        tanggal_selesai_str = data["tanggal_selesai"]
-        jam_mulai = int(data["jam_mulai"])
-        jam_selesai = int(data["jam_selesai"])
-        total_harga = data["total_harga_final"]
+        id_ruangan = data.get("id_ruangan")
+        tanggal_mulai_str = data.get("tanggal_mulai")
+        tanggal_selesai_str = data.get("tanggal_selesai")
+        jam_mulai = int(data.get("jam_mulai", 0))
+        jam_selesai = int(data.get("jam_selesai", 0))
+        total_harga = data.get("total_harga_final", 0)
         
         payment_method = data.get("paymentMethod")
         membership_id = data.get("membershipId")
         credit_cost = data.get("creditCost", 0)
         virtual_office_id = data.get("virtualOfficeId")
-        benefit_cost = data.get("benefitCost", 0) # Total jam benefit yg akan dipakai
         
-        booking_source = data.get("booking_source", "RoomDetail") # Default 'RoomDetail'
+        booking_source = data.get("booking_source", "RoomDetail")
 
-        # --- Konversi & Kalkulasi Awal ---
+        # Validasi field wajib dasar
+        if not all([id_user, id_ruangan, tanggal_mulai_str, tanggal_selesai_str, jam_mulai, jam_selesai]):
+             return jsonify({"message": "ERROR", "error": "Data booking tidak lengkap."}), 400
+
+        # --- 2. Konversi Tanggal ---
         tanggal_mulai = datetime.strptime(tanggal_mulai_str, "%Y-%m-%d").date()
         tanggal_selesai = datetime.strptime(tanggal_selesai_str, "%Y-%m-%d").date()
         durasi_per_hari = jam_selesai - jam_mulai
+        
+        if durasi_per_hari <= 0:
+             return jsonify({"message": "ERROR", "error": "Durasi booking tidak valid."}), 400
 
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
         
         connection.start_transaction()
 
-        # --- VALIDASI KETERSEDIAAN (Tidak berubah) ---
+        # --- 3. Validasi Ketersediaan (Anti-Bentrok) ---
         current_date_check = tanggal_mulai
         while current_date_check <= tanggal_selesai:
             waktu_mulai_check = datetime.combine(current_date_check, datetime.min.time()).replace(hour=jam_mulai)
@@ -1479,7 +1510,7 @@ def book_ruangan():
             
             current_date_check += timedelta(days=1)
 
-        # --- VALIDASI ULANG SISA BENEFIT/KREDIT DI SISI SERVER (PENGAMAN) ---
+        # --- 4. Validasi Saldo/Benefit ---
         if payment_method == 'credit':
             cursor.execute("SELECT sisa_credit FROM memberships WHERE id_memberships = %s AND id_user = %s", (membership_id, id_user))
             member = cursor.fetchone()
@@ -1488,47 +1519,90 @@ def book_ruangan():
                 return jsonify({"message": "ERROR", "error": "Kredit tidak mencukupi atau membership tidak valid."}), 400
         
         elif payment_method == 'virtual_office':
-            # Logika ini mirip dengan endpoint `getVOClientByUserId` untuk validasi terakhir
-            cursor.execute("SELECT pvo.benefit_jam_meeting_room_per_bulan, pvo.benefit_jam_working_space_per_bulan FROM client_virtual_office cvo JOIN paket_virtual_office pvo ON cvo.id_paket_vo = pvo.id_paket_vo WHERE cvo.id_client_vo = %s AND cvo.id_user = %s AND cvo.status_client_vo = 'Aktif'", (virtual_office_id, id_user))
+            # Ambil paket VO aktif
+            cursor.execute("""
+                SELECT 
+                    cvo.id_client_vo,
+                    pvo.benefit_jam_meeting_room_per_bulan, 
+                    pvo.benefit_jam_working_space_per_bulan 
+                FROM client_virtual_office cvo 
+                JOIN paket_virtual_office pvo ON cvo.id_paket_vo = pvo.id_paket_vo 
+                WHERE cvo.id_client_vo = %s AND cvo.id_user = %s AND cvo.status_client_vo = 'Aktif'
+            """, (virtual_office_id, id_user))
             paket_vo = cursor.fetchone()
+            
             if not paket_vo:
                 connection.rollback()
-                return jsonify({"message": "ERROR", "error": "Klien Virtual Office tidak valid."}), 400
-            
-            # (Tambahkan logika pengecekan sisa benefit di sini jika diperlukan sebagai pengaman tambahan)
+                return jsonify({"message": "ERROR", "error": "Klien Virtual Office tidak valid atau tidak aktif."}), 400
 
-        # --- LOGIKA UTAMA: PEMBUATAN TRANSAKSI & BOOKING ---
-        
-        # 1. Tentukan detail untuk tabel transaksi
+            # Cek jenis ruangan untuk menentukan kuota mana yang dicek
+            cursor.execute("SELECT kr.nama_kategori FROM ruangan r JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan WHERE r.id_ruangan = %s", (id_ruangan,))
+            kat_ruangan = cursor.fetchone()
+            jenis_benefit = 'meeting_room' if kat_ruangan and 'Meeting' in kat_ruangan['nama_kategori'] else 'working_space'
+            
+            # Hitung pemakaian bulan ini
+            today = datetime.now()
+            cursor.execute("""
+                SELECT SUM(durasi_terpakai_menit) as total_used 
+                FROM penggunaan_benefit_vo 
+                WHERE id_client_vo = %s AND jenis_benefit = %s AND MONTH(tanggal_penggunaan) = %s AND YEAR(tanggal_penggunaan) = %s
+            """, (virtual_office_id, jenis_benefit, today.month, today.year))
+            usage = cursor.fetchone()
+            used_minutes = usage['total_used'] if usage and usage['total_used'] else 0
+            
+            limit_minutes = (paket_vo[f'benefit_jam_{jenis_benefit}_per_bulan'] or 0) * 60
+            
+            # Hitung durasi booking total (menit)
+            total_days = (tanggal_selesai - tanggal_mulai).days + 1
+            booking_minutes = durasi_per_hari * 60 * total_days
+            
+            if (used_minutes + booking_minutes) > limit_minutes:
+                 connection.rollback()
+                 return jsonify({"message": "ERROR", "error": "Sisa kuota benefit Virtual Office tidak mencukupi."}), 400
+
+
+        # --- 5. Persiapan Data Transaksi ---
         harga_transaksi = 0
-        metode_pembayaran_db = "qris" # Default
+        metode_pembayaran_db = "qris" 
+        status_pembayaran_awal = 'Lunas' # Default Lunas (untuk Credit/VO)
+
         if payment_method == 'normal':
             harga_transaksi = total_harga
+            status_pembayaran_awal = 'Belum Lunas' # PENTING: Untuk iPaymu
+            metode_pembayaran_db = "Ipaymu" # Label sementara
         elif payment_method == 'credit':
             metode_pembayaran_db = "Membership Credit"
         elif payment_method == 'virtual_office':
             metode_pembayaran_db = "Virtual Office Benefit"
 
-        # 2. Buat satu record transaksi
-        insert_transaksi = "INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order, lokasi_pemesanan, booking_source) VALUES (%s, %s, %s, 'Lunas', 'Baru', %s, %s)"
-        cursor.execute(insert_transaksi, (id_user, harga_transaksi, metode_pembayaran_db, f"ruangan_{id_ruangan}", booking_source))
+        # --- 6. Insert Transaksi ---
+        insert_transaksi = """
+            INSERT INTO transaksi (
+                id_user, total_harga_final, metode_pembayaran, 
+                status_pembayaran, status_order, lokasi_pemesanan, booking_source
+            ) VALUES (%s, %s, %s, %s, 'Baru', %s, %s)
+        """
+        cursor.execute(insert_transaksi, (
+            id_user, harga_transaksi, metode_pembayaran_db, 
+            status_pembayaran_awal, f"ruangan_{id_ruangan}", booking_source
+        ))
         id_transaksi = cursor.lastrowid
         
-        # 3. Proses pengurangan (jika ada)
+        # --- 7. Kurangi Kredit (Jika pakai kredit) ---
         if payment_method == 'credit':
             update_credit_query = "UPDATE memberships SET sisa_credit = sisa_credit - %s WHERE id_memberships = %s"
             cursor.execute(update_credit_query, (credit_cost, membership_id))
-            if cursor.rowcount == 0:
-                connection.rollback()
-                return jsonify({"message": "ERROR", "error": "Gagal mengurangi kredit membership."}), 500
 
-        # 4. Ambil kategori ruangan untuk menentukan `jenis_benefit` VO
-        cursor.execute("SELECT kr.nama_kategori FROM ruangan r JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan WHERE r.id_ruangan = %s", (id_ruangan,))
-        kategori_ruangan = cursor.fetchone()
-        jenis_benefit_vo = 'meeting_room' if kategori_ruangan and 'Meeting' in kategori_ruangan['nama_kategori'] else 'working_space'
-
-        # 5. Loop untuk membuat record booking per hari & mencatat penggunaan benefit
+        # --- 8. Loop Insert Booking & Benefit Usage ---
         current_date_insert = tanggal_mulai
+        
+        # Ambil ulang kategori untuk loop insert (jika belum diambil di validasi)
+        if 'kat_ruangan' not in locals():
+             cursor.execute("SELECT kr.nama_kategori FROM ruangan r JOIN kategori_ruangan kr ON r.id_kategori_ruangan = kr.id_kategori_ruangan WHERE r.id_ruangan = %s", (id_ruangan,))
+             kat_ruangan = cursor.fetchone()
+        
+        jenis_benefit_vo = 'meeting_room' if kat_ruangan and 'Meeting' in kat_ruangan['nama_kategori'] else 'working_space'
+
         while current_date_insert <= tanggal_selesai:
             waktu_mulai_db = datetime.combine(current_date_insert, datetime.min.time()).replace(hour=jam_mulai)
             waktu_selesai_db = datetime.combine(current_date_insert, datetime.min.time()).replace(hour=jam_selesai)
@@ -1536,33 +1610,80 @@ def book_ruangan():
             id_mships = membership_id if payment_method == 'credit' else None
             kredit_per_hari = durasi_per_hari if payment_method == 'credit' else 0
             
-            # Insert ke booking_ruangan
-            insert_booking = "INSERT INTO booking_ruangan (id_transaksi, id_ruangan, id_memberships, waktu_mulai, waktu_selesai, durasi, kredit_terpakai) VALUES (%s, %s, %s, %s, %s, %s, %s)"
-            cursor.execute(insert_booking, (id_transaksi, id_ruangan, id_mships, waktu_mulai_db, waktu_selesai_db, durasi_per_hari, kredit_per_hari))
+            # Insert Booking
+            insert_booking = """
+                INSERT INTO booking_ruangan (
+                    id_transaksi, id_ruangan, id_memberships, 
+                    waktu_mulai, waktu_selesai, durasi, kredit_terpakai
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_booking, (
+                id_transaksi, id_ruangan, id_mships, 
+                waktu_mulai_db, waktu_selesai_db, durasi_per_hari, kredit_per_hari
+            ))
             id_booking_baru = cursor.lastrowid
 
-            # JIKA VIRTUAL OFFICE, catat penggunaannya di tabel `penggunaan_benefit_vo`
+            # Insert Penggunaan Benefit VO
             if payment_method == 'virtual_office':
                 durasi_menit_harian = durasi_per_hari * 60
-                insert_usage_query = "INSERT INTO penggunaan_benefit_vo (id_client_vo, id_booking, jenis_benefit, durasi_terpakai_menit, tanggal_penggunaan) VALUES (%s, %s, %s, %s, %s)"
-                cursor.execute(insert_usage_query, (virtual_office_id, id_booking_baru, jenis_benefit_vo, durasi_menit_harian, waktu_mulai_db))
+                insert_usage_query = """
+                    INSERT INTO penggunaan_benefit_vo (
+                        id_client_vo, id_booking, jenis_benefit, 
+                        durasi_terpakai_menit, tanggal_penggunaan
+                    ) VALUES (%s, %s, %s, %s, %s)
+                """
+                cursor.execute(insert_usage_query, (
+                    virtual_office_id, id_booking_baru, jenis_benefit_vo, 
+                    durasi_menit_harian, waktu_mulai_db
+                ))
 
             current_date_insert += timedelta(days=1)
 
-        # Jika semua berhasil, commit transaksi
-        connection.commit()
+        # --- 9. Integrasi iPaymu (Jika Pembayaran Normal) ---
+        payment_url = None
+        if payment_method == 'normal':
+            # Ambil data user lengkap
+            cursor.execute("SELECT nama, email, no_telepon FROM users WHERE id_user = %s", (id_user,))
+            user_data = cursor.fetchone()
+            
+            ipaymu_res = create_ipaymu_payment(
+                id_transaksi=id_transaksi,
+                amount=harga_transaksi,
+                buyer_name=user_data['nama'] if user_data else "Guest",
+                buyer_phone=user_data['no_telepon'],
+                buyer_email=user_data['email']
+            )
+            
+            if ipaymu_res['success']:
+                payment_url = ipaymu_res['url']
+                # BARU COMMIT DI SINI JIKA SUKSES
+                connection.commit() 
+            else:
+                # JIKA GAGAL: ROLLBACK & KIRIM ERROR KE FRONTEND
+                connection.rollback()
+                error_message = f"Gagal koneksi ke Payment Gateway: {ipaymu_res.get('message')}"
+                print(error_message) # Print di terminal backend
+                return jsonify({"message": "ERROR", "error": error_message}), 500
 
-        return jsonify({"message": "Booking berhasil", "id_transaksi": id_transaksi}), 201
+        else:
+            # Jika bukan pembayaran normal (Kredit/VO), langsung commit
+            connection.commit()
+
+        return jsonify({
+            "message": "Booking berhasil diproses", 
+            "id_transaksi": id_transaksi,
+            "payment_url": payment_url
+        }), 201
 
     except Exception as e:
         if connection: connection.rollback()
-        print(f"Error pada /bookRuangan: {e}") # Logging error
+        import traceback
+        traceback.print_exc() # Print full error di terminal backend
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-        
-        
+                
         
 # @ruangan_endpoints.route('/bookRuangan', methods=['POST'])
 # def book_ruangan():

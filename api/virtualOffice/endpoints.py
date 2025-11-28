@@ -2,6 +2,7 @@
 import os
 from flask import Blueprint, jsonify, request
 import mysql
+from api.utils.ipaymu_helper import create_ipaymu_payment
 from helper.db_helper import get_connection
 from helper.form_validation import get_form_data
 from flask_jwt_extended import jwt_required
@@ -960,3 +961,63 @@ def confirm_vo_payment_and_activate(transaction_id):
         if 'cursor' in locals() and cursor: cursor.close()
         if 'connection' in locals() and connection and connection.is_connected(): # Cek is_connected
             connection.close()
+            
+            
+            
+@virtualOffice_endpoints.route('/get-payment-link/<int:id_transaksi>', methods=['GET'])
+def get_payment_link_vo(id_transaksi):
+    """
+    Mengambil ulang URL pembayaran iPaymu untuk transaksi yang belum lunas.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # 1. Ambil detail transaksi & user
+        cursor.execute("""
+            SELECT t.total_harga_final, t.status_pembayaran, 
+                   u.nama, u.email, u.no_telepon,
+                   cvo.nama as nama_pendaftar, cvo.email_perusahaan, cvo.nomor_telepon as telp_perusahaan
+            FROM transaksi t
+            JOIN client_virtual_office cvo ON t.id_transaksi = cvo.id_transaksi
+            JOIN users u ON t.id_user = u.id_user
+            WHERE t.id_transaksi = %s
+        """, (id_transaksi,))
+        trx = cursor.fetchone()
+
+        if not trx:
+            return jsonify({"message": "Transaksi tidak ditemukan"}), 404
+        
+        if trx['status_pembayaran'] == 'Lunas':
+            return jsonify({"message": "Transaksi sudah lunas"}), 400
+
+        # 2. Tentukan data pembeli (prioritas data VO > data User)
+        buyer_name = trx['nama_pendaftar'] or trx['nama']
+        buyer_email = trx['email_perusahaan'] or trx['email'] or "guest@dago.com"
+        buyer_phone = trx['telp_perusahaan'] or trx['no_telepon'] or "08123456789"
+
+        # 3. Request Link Baru ke iPaymu
+        # (iPaymu akan mengembalikan link yang sama jika session ID masih aktif, atau baru jika expired)
+        ipaymu_res = create_ipaymu_payment(
+            id_transaksi=id_transaksi,
+            amount=trx['total_harga_final'],
+            buyer_name=buyer_name,
+            buyer_phone=buyer_phone,
+            buyer_email=buyer_email
+        )
+
+        if ipaymu_res['success']:
+            return jsonify({
+                "message": "OK",
+                "payment_url": ipaymu_res['url']
+            }), 200
+        else:
+            return jsonify({"message": "ERROR", "error": ipaymu_res.get('message')}), 500
+
+    except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()            

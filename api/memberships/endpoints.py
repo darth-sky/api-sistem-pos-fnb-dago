@@ -1,6 +1,7 @@
 """Routes for module memberships"""
 import os
 from flask import Blueprint, jsonify, request
+from api.utils.ipaymu_helper import create_ipaymu_payment
 from helper.db_helper import get_connection
 from helper.form_validation import get_form_data
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -23,6 +24,7 @@ def read():
     results = cursor.fetchall()
     cursor.close()  # Close the cursor after query execution
     return jsonify({"message": "OK", "datas": results}), 200
+
 
 @memberships_endpoints.route('/paket_detail/<int:id>', methods=['GET'])
 def get_membership_detail(id):
@@ -425,16 +427,13 @@ def read_memberships_by_user(user_id):
 @memberships_endpoints.route('/register', methods=['POST'])
 def register_membership():
     """
-    Proses pendaftaran membership:
-    1. Buat transaksi pembelian paket
-    2. Buat membership aktif
+    Proses pendaftaran membership dengan pembayaran iPaymu
     """
     connection = None
     cursor = None
     try:
         data = request.get_json()
-        print("DEBUG DATA:", data)
-        id_user = data.get("id_user")  # bisa NULL kalau guest
+        id_user = data.get("id_user")
         phone = data.get("no_hp")
         id_paket = data.get("id_paket_membership")
 
@@ -444,62 +443,80 @@ def register_membership():
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # ambil detail paket membership
-        cursor.execute("""
-            SELECT harga, durasi, kuota 
-            FROM paket_membership 
-            WHERE id_paket_membership = %s
-        """, (id_paket,))
+        # 1. Ambil detail paket membership
+        cursor.execute("SELECT nama_paket, harga, durasi, kuota FROM paket_membership WHERE id_paket_membership = %s", (id_paket,))
         paket = cursor.fetchone()
 
         if not paket:
             return jsonify({"message": "Paket membership tidak ditemukan"}), 404
 
-        # 1. Insert transaksi
+        # 2. Ambil data user untuk iPaymu
+        cursor.execute("SELECT nama, email, no_telepon FROM users WHERE id_user = %s", (id_user,))
+        user_data = cursor.fetchone()
+        
+        # Fallback data jika user guest / data tidak lengkap
+        buyer_name = user_data['nama'] if user_data else "Guest Member"
+        buyer_email = user_data['email'] if user_data else "guest@dago.com"
+        buyer_phone = phone if phone else (user_data['no_telepon'] if user_data else "08123456789")
+
+        # 3. Insert Transaksi (Status: Belum Lunas)
         insert_transaksi = """
-        INSERT INTO transaksi (id_user, tanggal_transaksi, total_harga_final, 
-                               metode_pembayaran, status_pembayaran, status_order)
-        VALUES (%s, NOW(), %s, %s, %s, %s)
+            INSERT INTO transaksi (
+                id_user, tanggal_transaksi, total_harga_final, 
+                metode_pembayaran, status_pembayaran, status_order
+            ) VALUES (%s, NOW(), %s, 'Ipaymu', 'Belum Lunas', 'Baru')
         """
-        cursor.execute(insert_transaksi, (
-            id_user, paket["harga"], "Non-Tunai", "Lunas", "Baru",
-        ))
+        cursor.execute(insert_transaksi, (id_user, paket["harga"]))
         id_transaksi = cursor.lastrowid
 
-        # 2. Hitung tanggal mulai & berakhir
+        # 4. Insert Membership (Status: Inactive - Menunggu Pembayaran)
+        # Kita set Inactive dulu, nanti Callback yang akan mengaktifkannya
         cursor.execute("SELECT CURDATE() as today")
         today = cursor.fetchone()["today"]
         cursor.execute("SELECT DATE_ADD(CURDATE(), INTERVAL %s DAY) as end_date", (paket["durasi"],))
         end_date = cursor.fetchone()["end_date"]
 
-        # 3. Insert membership
         insert_membership = """
-        INSERT INTO memberships (id_user, id_paket_membership, id_transaksi,
-                                 tanggal_mulai, tanggal_berakhir,
-                                 total_credit, sisa_credit, status_memberships)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'Active')
+            INSERT INTO memberships (
+                id_user, id_paket_membership, id_transaksi,
+                tanggal_mulai, tanggal_berakhir,
+                total_credit, sisa_credit, status_memberships
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'Inactive')
         """
         cursor.execute(insert_membership, (
             id_user, id_paket, id_transaksi, today, end_date,
             paket["kuota"], paket["kuota"]
         ))
 
-        connection.commit()
+        # 5. Generate Link iPaymu
+        payment_url = None
+        ipaymu_res = create_ipaymu_payment(
+            id_transaksi=id_transaksi,
+            amount=paket["harga"],
+            buyer_name=buyer_name,
+            buyer_phone=buyer_phone,
+            buyer_email=buyer_email
+        )
+
+        if ipaymu_res['success']:
+            payment_url = ipaymu_res['url']
+            connection.commit() # Commit hanya jika generate link sukses
+        else:
+            connection.rollback() # Rollback jika gagal konek ke payment gateway
+            return jsonify({"message": "ERROR", "error": f"Gagal memproses pembayaran: {ipaymu_res.get('message')}"}), 500
+
         return jsonify({
             "message": "OK",
-            "id_transaksi": id_transaksi
+            "id_transaksi": id_transaksi,
+            "payment_url": payment_url
         }), 201
 
     except Exception as e:
-        if connection:
-            connection.rollback()
+        if connection: connection.rollback()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
+        if cursor: cursor.close()
+        if connection: connection.close()
 
 @memberships_endpoints.route('/create', methods=['POST'])
 @jwt_required()
