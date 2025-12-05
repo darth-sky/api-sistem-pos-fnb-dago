@@ -14,9 +14,17 @@ import math
 import traceback
 from datetime import datetime # --- PERUBAHAN 1: Impor library datetime ---
 from mysql.connector import Error as DbError
+import json
+from datetime import datetime, timedelta
+from flask import jsonify
 
 ruangan_endpoints = Blueprint('ruangan', __name__)
 UPLOAD_FOLDER = "img"
+
+
+
+
+
 
 @ruangan_endpoints.route('/private-office-rooms', methods=['GET'])
 def get_private_office_rooms():
@@ -906,34 +914,34 @@ def get_booked_hours(id_ruangan, tanggal):
             
             
             
-# Di atas file, pastikan Anda mengimpor json
-import json
-from datetime import datetime, timedelta
-from flask import jsonify
 
-# ... (kode lainnya)
+
 
 @ruangan_endpoints.route('/readPromos', methods=['GET'])
 def readPromo():
-    """Routes for module get list promo"""
+    """Routes for module get list promo specifically for Rooms"""
     try:
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # DIUBAH: Mengganti SELECT * dengan nama kolom eksplisit untuk memaksa pembacaan kolom 'syarat'
+        # ✅ PERBAIKAN DI SINI:
+        # 1. Tambahkan 'kategori_promo' di SELECT
+        # 2. Tambahkan filter IN ('room', 'all') di WHERE
         select_query = """
             SELECT 
                 id_promo, kode_promo, deskripsi_promo, nilai_diskon, 
                 tanggal_mulai, tanggal_selesai, waktu_mulai, waktu_selesai, 
-                status_aktif, syarat 
+                status_aktif, syarat, kategori_promo
             FROM promo
             WHERE status_aktif = 'aktif'
               AND CURDATE() BETWEEN tanggal_mulai AND tanggal_selesai
+              AND kategori_promo IN ('room', 'all')
         """
+        
         cursor.execute(select_query)
         results = cursor.fetchall()
 
-        # Proses setiap baris hasil
+        # Proses setiap baris hasil (JSON Parsing & String conversion)
         for row in results:
             if row.get('syarat') and isinstance(row['syarat'], str):
                 try:
@@ -953,7 +961,7 @@ def readPromo():
             cursor.close()
         if 'connection' in locals() and connection:
             connection.close()
-
+            
 # @ruangan_endpoints.route('/readPromo', methods=['GET'])
 # def readPromo():
 #     """Routes for module get list promo"""

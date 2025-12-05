@@ -87,7 +87,7 @@ def get_all_acara_admin():
         if cursor: cursor.close()
         if connection: connection.close()
         
-        
+
 # ✅ CREATE Acara (with image upload)
 @acara_endpoints.route('/createAcara', methods=['POST'])
 def create_acara():

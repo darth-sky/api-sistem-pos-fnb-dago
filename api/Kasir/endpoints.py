@@ -1213,22 +1213,25 @@ def save_kasir_order():
 
         # 6. Insert ke tabel 'transaksi' dengan status 'Disimpan'
         # --- PERUBAHAN 2: Tambahkan discount_nominal di Query ---
+        booking_source = data.get('booking_source', 'KasirWalkIn')
         query_transaksi = """
             INSERT INTO transaksi (
                 id_sesi, id_kasir_pembuat, nama_guest, lokasi_pemesanan, fnb_type,
                 subtotal, 
-                discount_percentage, discount_nominal, -- <-- Kolom discount_nominal
+                discount_percentage, discount_nominal,
                 pajak_persen, pajak_nominal, total_harga_final,
-                status_pembayaran, status_order, tanggal_transaksi, id_promo 
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Disimpan', 'Baru', NOW(), %s)
+                status_pembayaran, status_order, tanggal_transaksi, id_promo,
+                booking_source  -- <--- TAMBAH KOLOM INI
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Disimpan', 'Baru', NOW(), %s, %s)
         """
         values_transaksi = (
             id_sesi_aktif, id_user_kasir,
             customer_name, room, fnb_type_db,
             subtotal_backend, 
-            discount_percentage_frontend, discount_nominal_backend, # <-- Nilai discount_nominal
+            discount_percentage_frontend, discount_nominal_backend,
             pajak_persen_db, pajak_nominal_backend, total_harga_final_backend,
-            None # id_promo
+            None, # id_promo
+            booking_source # <--- MASUKKAN VALUE
         )
         # -------------------------------------------------------
         
@@ -1264,14 +1267,14 @@ def save_kasir_order():
         if connection and connection.is_connected():
             connection.close()
             
-                        
+
 @kasir_endpoints.route('/saved-order/<int:id_transaksi>', methods=['GET'])
 # @jwt_required() 
 def get_saved_order_detail(id_transaksi):
     """
     Mengambil detail transaksi dan SEMUA item (F&B dan Ruangan)
     untuk order yang disimpan.
-    MODIFIED: Sekarang mengambil discount_percentage dan harga ruangan yang benar.
+    FIXED: Mengambil discount_nominal dan discount_percentage.
     """
     connection = None
     cursor = None
@@ -1279,24 +1282,25 @@ def get_saved_order_detail(id_transaksi):
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # --- PERUBAHAN 1: Ambil 'discount_percentage' dari transaksi ---
+        # 1. Ambil Data Header Transaksi
         cursor.execute("""
             SELECT
                 id_transaksi, nama_guest, lokasi_pemesanan, fnb_type,
                 subtotal, 
-                discount_percentage, -- <-- KOLOM BARU DIAMBIL
+                discount_percentage, 
+                discount_nominal, -- ✅ FIX: Wajib ambil kolom ini
                 pajak_persen, pajak_nominal, total_harga_final,
                 status_pembayaran, status_order, tanggal_transaksi
             FROM transaksi
             WHERE id_transaksi = %s AND status_pembayaran = 'Disimpan'
         """, (id_transaksi,))
+        
         transaksi_data = cursor.fetchone()
-        # --- AKHIR PERUBAHAN 1 ---
 
         if not transaksi_data:
             return jsonify({"message": "ERROR", "error": "Order tersimpan tidak ditemukan atau statusnya bukan 'Disimpan'."}), 404
 
-        # 2. Ambil detail item F&B terkait (Query ini sudah benar)
+        # 2. Ambil detail item F&B (Tidak berubah)
         cursor.execute("""
             SELECT
                 dof.id_detail_order, dof.id_produk, pf.nama_produk,
@@ -1312,31 +1316,23 @@ def get_saved_order_detail(id_transaksi):
         """, (id_transaksi,))
         detail_items_fnb = cursor.fetchall()
         
-        # --- PERUBAHAN 2: Ambil 'harga_saat_booking' dari booking_ruangan ---
+        # 3. Ambil detail item Ruangan (Tidak berubah)
         cursor.execute("""
             SELECT 
                 br.id_booking, br.id_ruangan, r.nama_ruangan,
                 br.waktu_mulai, br.waktu_selesai, br.durasi,
                 (br.durasi / 60) AS durasi_jam,
                 HOUR(br.waktu_mulai) AS waktu_mulai_jam,
-                
-                -- --- GANTI RUMUS DENGAN KOLOM BARU ---
                 br.harga_saat_booking AS harga_paket 
-                -- --- AKHIR PERUBAHAN QUERY HARGA ---
-                
             FROM booking_ruangan br
             JOIN ruangan r ON br.id_ruangan = r.id_ruangan
-            -- JOIN transaksi t ON br.id_transaksi = t.id_transaksi (Tidak perlu lagi)
             WHERE br.id_transaksi = %s
         """, (id_transaksi,))
         detail_items_room = cursor.fetchall()
-        # --- AKHIR PERUBAHAN 2 ---
         
-        
-        # --- Format respons campuran (Tidak berubah) ---
+        # 4. Format Items (Mapping Data)
         response_items = []
         
-        # Format F&B items
         for item in detail_items_fnb:
             response_items.append({
                 "id": item['id_produk'],
@@ -1351,62 +1347,58 @@ def get_saved_order_detail(id_transaksi):
                 "available": item['status_ketersediaan'] == 'Active'
             })
             
-        # Format Room items
         for item in detail_items_room:
             start_hour = item['waktu_mulai'].hour
             end_hour = item['waktu_selesai'].hour
-            
             response_items.append({
                 "id": item['id_ruangan'],
                 "cartId": f"room_{item['id_ruangan']}_{start_hour}",
                 "type": "room",
                 "name": item['nama_ruangan'],
-                "price": float(item['harga_paket']), # <-- Ini sekarang harga yang benar
+                "price": float(item['harga_paket']),
                 "qty": 1,
                 "note": f"Booking {start_hour:02d}:00 - {end_hour:02d}:00",
                 "bookingData": {
                     "id_ruangan": item['id_ruangan'],
                     "durasi_jam": int(item['durasi_jam']),
                     "waktu_mulai_jam": start_hour,
-                    "total_harga_final": float(item['harga_paket']) # <-- Ini juga harga yang benar
+                    "total_harga_final": float(item['harga_paket'])
                 }
             })
 
-        # --- PERUBAHAN 3: Masukkan 'discount_percentage' ke respons ---
+        # 5. Susun Response Akhir
         response_data = {
             "id_transaksi": transaksi_data['id_transaksi'],
             "customerName": transaksi_data['nama_guest'],
-            "orderType": transaksi_data['fnb_type'].lower().replace(" ", ""),
+            "orderType": transaksi_data['fnb_type'].lower().replace(" ", "") if transaksi_data['fnb_type'] else "dinein",
             "room": transaksi_data['lokasi_pemesanan'],
-            "subtotal": float(transaksi_data['subtotal']),
-            "taxPercentage": float(transaksi_data['pajak_persen']),
-            "taxNominal": float(transaksi_data['pajak_nominal']),
-            "totalAmount": float(transaksi_data['total_harga_final']),
-            "tanggal_transaksi": transaksi_data['tanggal_transaksi'].isoformat(),
             
-            # --- GANTI 0.0 DENGAN DATA DARI DB ---
-            "discountPercentage": float(transaksi_data.get('discount_percentage', 0.0)), 
-            # --- AKHIR PERUBAHAN 3 ---
+            "subtotal": float(transaksi_data['subtotal'] or 0),
+            "taxPercentage": float(transaksi_data['pajak_persen'] or 0),
+            "taxNominal": float(transaksi_data['pajak_nominal'] or 0),
+            "totalAmount": float(transaksi_data['total_harga_final'] or 0),
+            
+            "tanggal_transaksi": transaksi_data['tanggal_transaksi'].isoformat() if transaksi_data['tanggal_transaksi'] else None,
+            
+            # ✅ FIX: Pastikan kedua field ini terkirim
+            "discountPercentage": float(transaksi_data.get('discount_percentage', 0.0) or 0), 
+            "discountNominal": float(transaksi_data.get('discount_nominal', 0.0) or 0), 
             
             "items": response_items
         }
-        # --- AKHIR PERUBAHAN 3 ---
 
         return jsonify(response_data), 200
 
     except mysql.connector.Error as db_err:
-        print(f"Database error saat mengambil detail order tersimpan: {db_err}")
-        traceback.print_exc()
+        print(f"Database error: {db_err}")
         return jsonify({"message": "ERROR", "error": f"Database error: {db_err.msg}"}), 500
     except Exception as e:
-        print(f"Error saat mengambil detail order tersimpan: {str(e)}")
-        traceback.print_exc()
-        return jsonify({"message": "ERROR", "error": "Terjadi kesalahan internal pada server."}), 500
+        print(f"Error: {str(e)}")
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
-        if connection and connection.is_connected():
-            connection.close()
-            
+        if connection: connection.close()
+                    
 
 @kasir_endpoints.route('/pay-saved-order/<int:id_transaksi>', methods=['POST'])
 @jwt_required()
@@ -1469,14 +1461,16 @@ def pay_saved_order(id_transaksi):
             cursor, items_frontend_updated, discount_percentage_frontend, discount_nominal_frontend
         )
 
-        # 7. Update Transaksi
+        booking_source = data.get('booking_source', 'KasirWalkIn')
+
         query_update = """
             UPDATE transaksi SET
                 nama_guest=%s, lokasi_pemesanan=%s, metode_pembayaran=%s,
                 subtotal=%s, discount_percentage=%s, discount_nominal=%s,
                 pajak_persen=%s, pajak_nominal=%s, total_harga_final=%s,
                 status_pembayaran='Lunas', tanggal_transaksi=NOW(),
-                id_sesi=%s, id_kasir_pembuat=%s, uang_diterima=%s, kembalian=%s
+                id_sesi=%s, id_kasir_pembuat=%s, uang_diterima=%s, kembalian=%s,
+                booking_source=%s  -- <--- UPDATE KOLOM INI
             WHERE id_transaksi=%s
         """
         values = (
@@ -1484,7 +1478,8 @@ def pay_saved_order(id_transaksi):
             subtotal_backend, discount_percentage_frontend, discount_nominal_backend,
             pajak_persen_db, pajak_nominal_backend, total_harga_final_backend,
             id_sesi_aktif, id_user_kasir, uang_diterima_db, kembalian_db,
-            id_transaksi
+            booking_source,
+            id_transaksi,
         )
         cursor.execute(query_update, values)
 
@@ -2402,6 +2397,7 @@ def get_voucher_duration_by_price(total_amount):
     else:
         return 8 # Maksimal 8 Jam untuk belanja > 150rb
 
+
 # --- ENDPOINT 1: BUAT ORDER BARU ---
 @kasir_endpoints.route('/order', methods=['POST'])
 @jwt_required()
@@ -2466,21 +2462,33 @@ def create_kasir_order_with_tax():
         )
 
         # 6. Insert Transaksi
+        booking_source = data.get('booking_source', 'KasirWalkIn')
+
+        # ... (kode validasi & kalkulasi) ...
+
+        # 6. Insert Transaksi
+        # PERBAIKAN: Tambahkan kolom booking_source
+        # 6. Insert Transaksi
         query_transaksi = """
             INSERT INTO transaksi (
                 id_user, id_sesi, id_kasir_pembuat, nama_guest, lokasi_pemesanan, 
                 fnb_type, metode_pembayaran, uang_diterima, kembalian,
                 subtotal, discount_percentage, discount_nominal,
                 pajak_persen, pajak_nominal, total_harga_final,
-                status_pembayaran, status_order, tanggal_transaksi
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Lunas', 'Baru', NOW())
+                status_pembayaran, status_order, tanggal_transaksi,
+                booking_source
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Lunas', 'Baru', NOW(), %s)
         """
+        # Perhatikan: Bagian akhir string di atas bersih, hanya "... NOW(), %s)"
+        
         values = (
             data.get('id_user_pelanggan'), id_sesi_aktif, id_user_kasir, customer_name, room,
             fnb_type_db, metode_pembayaran_db, uang_diterima_db, kembalian_db,
             subtotal_backend, discount_percentage_frontend, discount_nominal_backend,
-            pajak_persen_db, pajak_nominal_backend, total_harga_final_backend
+            pajak_persen_db, pajak_nominal_backend, total_harga_final_backend,
+            booking_source
         )
+        
         cursor.execute(query_transaksi, values)
         id_transaksi_baru = cursor.lastrowid
 
@@ -2539,7 +2547,7 @@ def create_kasir_order_with_tax():
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-        
+
         
 @kasir_endpoints.route('/productsKasir', methods=['GET'])
 def get_products():

@@ -1947,11 +1947,11 @@ def delete_pengeluaran(id_pengeluaran):
 
 
 @admin_endpoints.route('/laporanBagiHasil', methods=['GET'])
+@jwt_required()
 def get_laporan_bagi_hasil():
     connection = None
     cursor = None
     try:
-        # --- PERUBAHAN 1: Ambil startDate dan endDate ---
         start_date_str = request.args.get('startDate')
         end_date_str = request.args.get('endDate')
 
@@ -1961,104 +1961,118 @@ def get_laporan_bagi_hasil():
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
         
-        # --- PERUBAHAN 2: Modifikasi Query SQL ---
+        # --- QUERY SQL DIPERBARUI ---
+        # Menggunakan COALESCE dan NULLIF untuk menangani pembagian nol dan nilai null
         query = """
-            -- Bagian 1: Pendapatan Tenant F&B
+            -- BAGIAN 1: TENANT F&B (Menggunakan proporsi item terhadap total transaksi untuk split pajak/diskon)
             SELECT 
                 t.id_tenant AS id,
                 t.nama_tenant AS tenant,
-                SUM(dof.harga_saat_order * dof.jumlah) AS total,
+                
+                -- Subtotal Murni Barang
+                SUM(dof.harga_saat_order * dof.jumlah) AS subtotal,
+                
+                -- Pajak (Proporsional: (Subtotal Item / Subtotal Transaksi) * Pajak Transaksi)
+                SUM(tr.pajak_nominal * ((dof.harga_saat_order * dof.jumlah) / NULLIF(tr.subtotal, 0))) AS tax,
+                
+                -- Diskon (Proporsional)
+                SUM(tr.discount_nominal * ((dof.harga_saat_order * dof.jumlah) / NULLIF(tr.subtotal, 0))) AS discount,
+                
+                -- Grand Total (Uang Masuk Riil per Item)
+                SUM(
+                    (dof.harga_saat_order * dof.jumlah) + 
+                    (tr.pajak_nominal * ((dof.harga_saat_order * dof.jumlah) / NULLIF(tr.subtotal, 0))) - 
+                    (tr.discount_nominal * ((dof.harga_saat_order * dof.jumlah) / NULLIF(tr.subtotal, 0)))
+                ) AS grandTotal,
+                
+                -- Bagi Hasil (Basis perhitungan biasanya dari Subtotal atau Grand Total - Tax. Di sini kita pakai Gross Sales items * 0.7 sesuai kode lama)
                 SUM(dof.harga_saat_order * dof.jumlah) * 0.7 AS tenantShare,
                 SUM(dof.harga_saat_order * dof.jumlah) * 0.3 AS ownerShare,
+                
                 FALSE AS isInternal
             FROM transaksi tr
             JOIN detail_order_fnb dof ON tr.id_transaksi = dof.id_transaksi
             JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
             JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
             JOIN tenants t ON kp.id_tenant = t.id_tenant
-            WHERE 
-                tr.status_pembayaran = 'Lunas' AND
-                -- Menggunakan DATE() untuk memastikan perbandingan tanggal saja, tanpa waktu
-                DATE(tr.tanggal_transaksi) BETWEEN %s AND %s
+            WHERE tr.status_pembayaran = 'Lunas' AND DATE(tr.tanggal_transaksi) BETWEEN %s AND %s
             GROUP BY t.id_tenant, t.nama_tenant
 
             UNION ALL
 
-            -- Bagian 2: Pendapatan Internal (Sewa Ruangan, Membership, dll)
+            -- BAGIAN 2: PENDAPATAN INTERNAL (Working Space, Event, dll)
             SELECT
-                999 AS id, -- ID statis untuk pendapatan internal
+                999 AS id,
                 'Dago Creative Space (Internal)' AS tenant,
-                COALESCE(SUM(total), 0) AS total,
-                0 AS tenantShare,
-                COALESCE(SUM(total), 0) AS ownerShare,
-                TRUE AS isInternal
-            FROM (
-                -- Pendapatan dari booking ruangan
-                SELECT SUM(tr.total_harga_final) as total
-                FROM transaksi tr
-                JOIN booking_ruangan br ON tr.id_transaksi = br.id_transaksi
-                WHERE tr.status_pembayaran = 'Lunas' AND DATE(tr.tanggal_transaksi) BETWEEN %s AND %s
+                SUM(tr.subtotal) AS subtotal,
+                SUM(tr.pajak_nominal) AS tax,
+                SUM(tr.discount_nominal) AS discount,
+                SUM(tr.total_harga_final) AS grandTotal, -- Total uang masuk
                 
-                UNION ALL
-
-                -- Pendapatan dari booking event space
-                SELECT SUM(tr.total_harga_final) as total
-                FROM transaksi tr
-                JOIN booking_event be ON tr.id_transaksi = be.id_transaksi
-                WHERE tr.status_pembayaran = 'Lunas' AND DATE(tr.tanggal_transaksi) BETWEEN %s AND %s
-
-                UNION ALL
-
-                -- Pendapatan dari pembelian membership
-                SELECT SUM(tr.total_harga_final) as total
-                FROM transaksi tr
-                JOIN memberships m ON tr.id_transaksi = m.id_transaksi
-                WHERE tr.status_pembayaran = 'Lunas' AND DATE(tr.tanggal_transaksi) BETWEEN %s AND %s
-
-                UNION ALL
-
-                -- Pendapatan dari virtual office
-                SELECT SUM(tr.total_harga_final) as total
-                FROM transaksi tr
-                JOIN client_virtual_office cvo ON tr.id_transaksi = cvo.id_transaksi
-                WHERE tr.status_pembayaran = 'Lunas' AND DATE(tr.tanggal_transaksi) BETWEEN %s AND %s
-            ) AS pendapatan_internal;
+                -- Bagi hasil 0 untuk internal, semua masuk Owner
+                0 AS tenantShare,
+                SUM(tr.total_harga_final) AS ownerShare, -- Owner dapat grand total (atau net tergantung kebijakan, disini grand total)
+                
+                TRUE AS isInternal
+            FROM transaksi tr
+            -- Left join ke semua tabel sumber internal untuk memastikan ini bukan transaksi F&B murni yang tidak tercatat
+            LEFT JOIN booking_ruangan br ON tr.id_transaksi = br.id_transaksi
+            LEFT JOIN booking_event be ON tr.id_transaksi = be.id_transaksi
+            LEFT JOIN memberships m ON tr.id_transaksi = m.id_transaksi
+            LEFT JOIN client_virtual_office cvo ON tr.id_transaksi = cvo.id_transaksi
+            WHERE 
+                tr.status_pembayaran = 'Lunas' 
+                AND DATE(tr.tanggal_transaksi) BETWEEN %s AND %s
+                -- Filter: Pastikan salah satu ID booking/member ada (menandakan ini internal)
+                AND (br.id_booking IS NOT NULL OR be.id_booking_event IS NOT NULL OR m.id_memberships IS NOT NULL OR cvo.id_client_vo IS NOT NULL)
         """
         
-        # --- PERUBAHAN 3: Update Parameter untuk Query ---
-        params = (start_date_str, end_date_str, start_date_str, end_date_str, start_date_str, end_date_str, start_date_str, end_date_str, start_date_str, end_date_str)
+        # Parameter tanggal (diulang 4 kali karena ada 4 placeholder %s)
+        params = (start_date_str, end_date_str, start_date_str, end_date_str)
         cursor.execute(query, params)
         results = cursor.fetchall()
 
-        # Filter out rows where total is None (terjadi jika salah satu UNION tidak menghasilkan apa-apa)
-        # Dan pastikan Dago Internal tetap muncul meskipun totalnya 0
-        final_results = [row for row in results if row['total'] is not None]
+        final_results = []
+        dago_exists = False
         
-        dago_internal_exists = any(row['isInternal'] for row in final_results)
-        if not dago_internal_exists:
+        # Pembersihan Data (Konversi Decimal ke Float untuk JSON)
+        for row in results:
+            if row['grandTotal'] is None and row['subtotal'] is None: 
+                continue 
+            
+            # Helper function untuk safe float conversion
+            def to_float(val): return float(val) if val is not None else 0.0
+
+            row['subtotal'] = to_float(row['subtotal'])
+            row['tax'] = to_float(row['tax'])
+            row['discount'] = to_float(row['discount'])
+            row['grandTotal'] = to_float(row['grandTotal'])
+            row['tenantShare'] = to_float(row['tenantShare'])
+            row['ownerShare'] = to_float(row['ownerShare'])
+            
+            if row['isInternal']: 
+                dago_exists = True
+            
+            final_results.append(row)
+
+        # Jika tidak ada transaksi internal, tetap tampilkan baris Dago (0 rupiah) agar tabel rapi
+        if not dago_exists:
             final_results.append({
-                'id': 999,
-                'tenant': 'Dago Creative Space (Internal)',
-                'total': 0.0,
-                'tenantShare': 0.0,
-                'ownerShare': 0.0,
-                'isInternal': True
+                'id': 999, 'tenant': 'Dago Creative Space (Internal)',
+                'subtotal': 0.0, 'tax': 0.0, 'discount': 0.0, 'grandTotal': 0.0,
+                'tenantShare': 0.0, 'ownerShare': 0.0, 'isInternal': True
             })
-
-
-        for row in final_results:
-            row['total'] = float(row['total']) if row['total'] is not None else 0.0
-            row['tenantShare'] = float(row['tenantShare']) if row['tenantShare'] is not None else 0.0
-            row['ownerShare'] = float(row['ownerShare']) if row['ownerShare'] is not None else 0.0
 
         return jsonify(final_results), 200
 
     except Exception as e:
+        print(f"Error Report: {e}") # Log error di server console
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
         if connection: connection.close()
-
+        
+        
 # ------------------- WS DASHBOARD (sesuai brief) -------------------
 # --- WS Dashboard: sesuai DB (durasi dari paket_harga_ruangan, daily=1..N) ---
 @admin_endpoints.route('/ws-dashboard-data', methods=['GET'])

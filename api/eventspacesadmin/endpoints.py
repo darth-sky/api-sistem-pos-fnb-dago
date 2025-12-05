@@ -29,7 +29,7 @@ def allowed_file(filename):
 def get_all_bookings():
     """
     Mengambil semua data booking event dengan informasi lengkap,
-    termasuk alasan pembatalan jika ada.
+    dikelompokkan menjadi 4 kategori status TERPISAH.
     """
     connection = None
     cursor = None
@@ -37,7 +37,7 @@ def get_all_bookings():
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # Query JOIN sekarang juga mengambil 'alasan_pembatalan'
+        # Query (Tidak berubah)
         query = """
             SELECT 
                 be.id_booking_event AS id,
@@ -55,7 +55,7 @@ def get_all_bookings():
                 be.kebutuhan_tambahan AS requirements,
                 t.tanggal_transaksi AS submittedAt,
                 be.status_booking AS status,
-                be.alasan_pembatalan AS rejectionReason  -- <-- PERUBAHAN DI SINI
+                be.alasan_pembatalan AS rejectionReason
             FROM booking_event be
             JOIN transaksi t ON be.id_transaksi = t.id_transaksi
             JOIN users u ON t.id_user = u.id_user
@@ -65,19 +65,30 @@ def get_all_bookings():
         cursor.execute(query)
         all_bookings = cursor.fetchall()
 
-        # Logika pengkategorian tidak perlu diubah
+        # --- INISIALISASI 4 KATEGORI ---
         categorized_bookings = {
-            'pending': [],
-            'approved': [],
-            'rejected': []
+            'pending': [],          # Status: Baru
+            'awaiting_payment': [], # Status: Menunggu Pembayaran (INI KUNCI PERBAIKANNYA)
+            'approved': [],         # Status: Confirmed / Selesai
+            'rejected': []          # Status: Dibatalkan
         }
         
+        # --- LOGIKA PEMISAHAN ---
         for booking in all_bookings:
-            if booking['status'] == 'Baru':
+            status = booking['status']
+            
+            if status == 'Baru':
                 categorized_bookings['pending'].append(booking)
-            elif booking['status'] == 'Confirmed' or booking['status'] == 'Selesai':
+                
+            elif status == 'Menunggu Pembayaran':
+                # Masukkan ke list KHUSUS, jangan ke approved
+                categorized_bookings['awaiting_payment'].append(booking)
+                
+            elif status in ['Confirmed', 'Selesai']:
+                # Hanya yang sudah Lunas/Selesai yang masuk sini
                 categorized_bookings['approved'].append(booking)
-            elif booking['status'] == 'Dibatalkan':
+                
+            elif status == 'Dibatalkan':
                 categorized_bookings['rejected'].append(booking)
 
         return jsonify(categorized_bookings), 200
@@ -85,68 +96,66 @@ def get_all_bookings():
     except Exception as e:
         return jsonify({"success": False, "message": f"Database error: {str(e)}"}), 500
     finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-            
+        if cursor: cursor.close()
+        if connection: connection.close()            
             
 # Endpoint untuk MENYETUJUI booking
 @eventspacesadmin_endpoints.route('/bookings/<int:booking_id>/approve', methods=['POST'])
+@jwt_required()
 def approve_booking(booking_id):
     """
-    Menyetujui booking event, mengubah status booking menjadi 'Confirmed'
-    dan mengubah status transaksi terkait menjadi 'Lunas' dan 'Selesai'.
+    Admin menyetujui booking, menetapkan harga, dan mengubah status
+    menjadi 'Menunggu Pembayaran' agar user bisa membayar.
     """
     connection = None
     cursor = None
     try:
-        connection = get_connection()
-        # PERUBAHAN 1: Gunakan dictionary=True untuk membaca id_transaksi
-        cursor = connection.cursor(dictionary=True) 
-        
-        # --- LOGIKA UPDATE GANDA ---
+        # 1. Ambil Harga dari Input Admin
+        data = request.get_json()
+        harga_final = data.get('harga_final')
 
-        # 1. Ambil id_transaksi dari booking_event yang akan disetujui
+        if not harga_final:
+             return jsonify({"success": False, "message": "Harga final wajib diisi oleh admin"}), 400
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        
+        # 2. Ambil detail booking
         cursor.execute("SELECT id_transaksi FROM booking_event WHERE id_booking_event = %s", (booking_id,))
         booking_to_approve = cursor.fetchone()
 
         if not booking_to_approve:
             return jsonify({"success": False, "message": "Booking tidak ditemukan"}), 404
         
-        id_transaksi_to_complete = booking_to_approve['id_transaksi']
+        id_transaksi = booking_to_approve['id_transaksi']
 
-        # 2. Update tabel booking_event (menjadi 'Confirmed')
-        query_booking = "UPDATE booking_event SET status_booking = 'Confirmed' WHERE id_booking_event = %s"
-        cursor.execute(query_booking, (booking_id,))
-        
-        # 3. PERUBAHAN 2: Update juga tabel transaksi (menjadi 'Lunas' dan 'Selesai')
+        # 3. Update Transaksi 
+        # PERBAIKAN: Ubah 'Ipaymu' menjadi 'Non-Tunai' sesuai ENUM database
         query_transaksi = """
             UPDATE transaksi 
-            SET status_pembayaran = 'Lunas', status_order = 'Selesai'
+            SET total_harga_final = %s, 
+                metode_pembayaran = 'Non-Tunai', 
+                status_order = 'Diproses'
             WHERE id_transaksi = %s
         """
-        cursor.execute(query_transaksi, (id_transaksi_to_complete,))
+        cursor.execute(query_transaksi, (harga_final, id_transaksi))
 
-        # 4. PERUBAHAN 3: Commit HANYA setelah kedua update berhasil
+        # 4. Update Status Booking menjadi 'Menunggu Pembayaran'
+        query_booking = "UPDATE booking_event SET status_booking = 'Menunggu Pembayaran' WHERE id_booking_event = %s"
+        cursor.execute(query_booking, (booking_id,))
+        
         connection.commit()
         
-        # --- AKHIR LOGIKA UPDATE GANDA ---
-        
-        return jsonify({"success": True, "message": f"Booking {booking_id} approved and transaction completed."}), 200
+        return jsonify({"success": True, "message": f"Booking #{booking_id} disetujui. Menunggu pembayaran user."}), 200
 
     except Exception as e:
         if connection:
-            # Rollback akan membatalkan KEDUA update jika salah satu gagal
             connection.rollback() 
         return jsonify({"success": False, "message": str(e)}), 500
     
     finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
+        if cursor: cursor.close()
+        if connection: connection.close()
 
 # ✅ PERBAIKAN: Endpoint untuk MENOLAK booking
 @eventspacesadmin_endpoints.route('/bookings/<int:booking_id>/reject', methods=['POST'])

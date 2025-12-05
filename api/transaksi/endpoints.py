@@ -1,4 +1,5 @@
 """Routes for module transaksi"""
+from datetime import datetime, timedelta
 import decimal
 import json
 import os
@@ -12,6 +13,83 @@ from helper.year_operation import check_age_book
 
 transaksi_endpoints = Blueprint('transaksi', __name__)
 UPLOAD_FOLDER = "img"
+
+
+@transaksi_endpoints.route('/promo/check', methods=['GET'])
+def check_promo_public():
+    """
+    Endpoint publik untuk mengecek validitas 1 kode promo.
+    Memvalidasi: Status, Tanggal, dan Waktu (Jam).
+    """
+    connection = None
+    cursor = None
+    try:
+        # 1. Ambil kode dari parameter URL (?code=KODE)
+        kode_input = request.args.get('code')
+        if not kode_input:
+            return jsonify({"message": "ERROR", "error": "Kode promo harus diisi"}), 400
+
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # 2. Query spesifik untuk 1 kode
+        query = """
+            SELECT 
+                id_promo, kode_promo, deskripsi_promo, nilai_diskon, 
+                tanggal_mulai, tanggal_selesai, waktu_mulai, waktu_selesai, 
+                syarat 
+            FROM promo
+            WHERE kode_promo = %s 
+              AND status_aktif = 'aktif'
+              AND CURDATE() BETWEEN tanggal_mulai AND tanggal_selesai
+        """
+        cursor.execute(query, (kode_input,))
+        promo = cursor.fetchone()
+
+        if not promo:
+            return jsonify({"message": "ERROR", "error": "Kode promo tidak ditemukan atau sudah kadaluarsa."}), 404
+
+        # 3. Validasi JAM (Waktu Mulai - Selesai)
+        # Contoh: Happy Hour jam 15:00 - 18:00
+        if promo['waktu_mulai'] and promo['waktu_selesai']:
+            current_time = datetime.now().time()
+            # Konversi timedelta ke time object jika perlu, tergantung driver mysql
+            start_time = (datetime.min + promo['waktu_mulai']).time() if isinstance(promo['waktu_mulai'], timedelta) else promo['waktu_mulai']
+            end_time = (datetime.min + promo['waktu_selesai']).time() if isinstance(promo['waktu_selesai'], timedelta) else promo['waktu_selesai']
+            
+            # Cek range waktu
+            if not (start_time <= current_time <= end_time):
+                 return jsonify({
+                     "message": "ERROR", 
+                     "error": f"Promo ini hanya berlaku pada pukul {start_time} - {end_time}."
+                 }), 400
+
+        # 4. Parsing JSON Syarat (Sama seperti kode lama Anda)
+        if promo.get('syarat') and isinstance(promo['syarat'], str):
+            try:
+                promo['syarat'] = json.loads(promo['syarat'])
+            except:
+                promo['syarat'] = None
+
+        # 5. Serialisasi Decimal/Time untuk JSON Response
+        for key, value in promo.items():
+            if isinstance(value, (datetime, timedelta, decimal.Decimal)):
+                promo[key] = str(value)
+            # Handle objek time python
+            if isinstance(value, type(datetime.now().time())):
+                 promo[key] = value.strftime("%H:%M:%S")
+
+        return jsonify(promo), 200
+
+    except Exception as e:
+        print(f"Error check promo: {e}")
+        return jsonify({"message": "ERROR", "error": "Terjadi kesalahan server"}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()
+
+
+
 
 
 @transaksi_endpoints.route('/read', methods=['GET'])
@@ -639,6 +717,58 @@ def get_repayment_link(id_transaksi):
             return jsonify({"message": "ERROR", "error": ipaymu_res.get('message')}), 500
 
     except Exception as e:
+        return jsonify({"message": "ERROR", "error": str(e)}), 500
+    finally:
+        if cursor: cursor.close()
+        if connection: connection.close()
+        
+        
+
+@transaksi_endpoints.route('/promo/list-active', methods=['GET'])
+def list_active_promos_public():
+    """
+    Mengambil daftar promo aktif khusus F&B (dan All) untuk pelanggan.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # ✅ PERUBAHAN: Tambahkan filter kategori_promo
+        query = """
+            SELECT 
+                id_promo, kode_promo, deskripsi_promo, nilai_diskon, 
+                tanggal_mulai, tanggal_selesai, waktu_mulai, waktu_selesai, 
+                syarat, kategori_promo
+            FROM promo
+            WHERE status_aktif = 'aktif'
+              AND CURDATE() BETWEEN tanggal_mulai AND tanggal_selesai
+              AND kategori_promo IN ('fnb', 'all') -- Filter khusus F&B
+            ORDER BY nilai_diskon DESC
+        """
+        cursor.execute(query)
+        promos = cursor.fetchall()
+
+        # Konversi data (Decimal/Date/JSON)
+        for p in promos:
+            # Parse JSON syarat
+            if p.get('syarat') and isinstance(p['syarat'], str):
+                try: p['syarat'] = json.loads(p['syarat'])
+                except: p['syarat'] = None
+            
+            # Convert tipe data non-JSON serializable
+            for key, value in p.items():
+                if isinstance(value, (decimal.Decimal, datetime, timedelta)):
+                    p[key] = str(value)
+                # Handle time objects (jam mulai/selesai)
+                if isinstance(value, type(datetime.now().time())):
+                    p[key] = value.strftime("%H:%M")
+
+        return jsonify({"message": "OK", "datas": promos}), 200
+
+    except Exception as e:
+        print(f"Error list promo: {e}")
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
         if cursor: cursor.close()
