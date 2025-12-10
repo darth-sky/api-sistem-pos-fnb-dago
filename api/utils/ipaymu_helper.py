@@ -34,7 +34,7 @@ def create_ipaymu_payment(id_transaksi, amount, buyer_name, buyer_phone, buyer_e
     # 3. Konfigurasi URL Callback & Redirect
     # PENTING: Ganti URL Ngrok ini setiap kali Anda restart Ngrok!
     # Cek terminal ngrok Anda untuk URL yang sedang aktif saat ini.
-    notify_url = "https://c6728aee3d65.ngrok-free.app/api/callback/ipaymu" 
+    notify_url = "https://891c0ee3f81e.ngrok-free.app/api/callback/ipaymu" 
     
     # URL Frontend (React)
     frontend_url = "http://localhost:5173" 

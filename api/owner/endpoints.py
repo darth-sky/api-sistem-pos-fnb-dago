@@ -525,56 +525,62 @@ def dashboard_summary():
         ]
 
         # ------------- (NEW) KONTRIBUSI TENANT FNB (nett per tenant) -------------
-        cursor.execute(  
-              """
-              WITH fnb_gross AS (
-                  SELECT dof.id_transaksi,
-                        SUM(dof.jumlah * dof.harga_saat_order) AS gross_fnb
-                  FROM detail_order_fnb dof
-                  JOIN transaksi t ON t.id_transaksi = dof.id_transaksi
-                  WHERE t.status_pembayaran = 'Lunas'
-                    AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
-                  GROUP BY dof.id_transaksi
-              ),
-              trans_disc AS (
-                  SELECT t.id_transaksi,
-                        t.total_harga_final,
-                        GREATEST((t.subtotal + t.pajak_nominal) - t.total_harga_final, 0) AS disc_trx
-                  FROM transaksi t
-                  WHERE t.status_pembayaran = 'Lunas'
-                    AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
-              ),
-              fnb_net AS (
-                  SELECT d.id_transaksi,
-                        GREATEST(COALESCE(g.gross_fnb,0) - d.disc_trx, 0) AS net_fnb
-                  FROM trans_disc d
-                  LEFT JOIN fnb_gross g ON g.id_transaksi = d.id_transaksi
-              )
-              SELECT 
-                  COALESCE(tn.nama_tenant, 'Tanpa Tenant') AS tenant,
-                  SUM(fn.net_fnb) AS nett
-              FROM fnb_net fn
-              JOIN detail_order_fnb dof ON dof.id_transaksi = fn.id_transaksi
-              JOIN produk_fnb pf ON pf.id_produk = dof.id_produk
-              LEFT JOIN kategori_produk kp ON kp.id_kategori = pf.id_kategori
-              LEFT JOIN tenants tn ON tn.id_tenant = kp.id_tenant
-              GROUP BY tenant
-              ORDER BY nett DESC;
-              """,
-              (start_date, end_date, start_date, end_date)
-          )
+        cursor.execute(
+            """
+            WITH fnb_gross AS (
+                -- 1. Hitung Gross per Transaksi (sebagai pembagi nanti)
+                SELECT dof.id_transaksi,
+                       SUM(dof.jumlah * dof.harga_saat_order) AS trans_gross
+                FROM detail_order_fnb dof
+                JOIN transaksi t ON t.id_transaksi = dof.id_transaksi
+                WHERE t.status_pembayaran = 'Lunas'
+                  AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+                GROUP BY dof.id_transaksi
+            ),
+            trans_disc AS (
+                -- 2. Hitung Nett per Transaksi (diskon dibebankan disini)
+                SELECT t.id_transaksi,
+                       GREATEST((t.subtotal + t.pajak_nominal) - t.total_harga_final, 0) AS disc_trx
+                FROM transaksi t
+                WHERE t.status_pembayaran = 'Lunas'
+                  AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+            ),
+            fnb_net AS (
+                -- 3. Gabungkan untuk dapat Total Nett per Transaksi
+                SELECT d.id_transaksi,
+                       g.trans_gross,
+                       GREATEST(COALESCE(g.trans_gross,0) - d.disc_trx, 0) AS net_fnb_total
+                FROM trans_disc d
+                JOIN fnb_gross g ON g.id_transaksi = d.id_transaksi
+            )
+            SELECT 
+                COALESCE(tn.nama_tenant, 'Tanpa Tenant') AS tenant,
+                -- 4. RUMUS KUNCI: (Harga Item / Total Gross Transaksi) * Total Nett Transaksi
+                SUM(
+                    (dof.jumlah * dof.harga_saat_order) / NULLIF(fn.trans_gross, 0) * fn.net_fnb_total
+                ) AS nett
+            FROM detail_order_fnb dof
+            JOIN fnb_net fn ON fn.id_transaksi = dof.id_transaksi
+            JOIN produk_fnb pf ON pf.id_produk = dof.id_produk
+            LEFT JOIN kategori_produk kp ON kp.id_kategori = pf.id_kategori
+            LEFT JOIN tenants tn ON tn.id_tenant = kp.id_tenant
+            GROUP BY tenant
+            ORDER BY nett DESC;
+            """,
+            (start_date, end_date, start_date, end_date)
+        )
 
         tenant_contribution = [
-              {"tenant": r["tenant"], "nett": float(r["nett"] or 0)}
-              for r in (cursor.fetchall() or [])
-          ]
+            {"tenant": r["tenant"], "nett": float(r["nett"] or 0)}
+            for r in (cursor.fetchall() or [])
+        ]
 
-          # Tambah Working Space sebagai satu row tersendiri
-        tenant_contribution.append({
-        "tenant": "Working Space",
-        "nett": totals["total_ws"]
-          })
-
+        # Tambah Working Space sebagai satu row tersendiri (jika perlu ditampilkan di chart yang sama)
+        if totals["total_ws"] > 0:
+            tenant_contribution.append({
+                "tenant": "Working Space",
+                "nett": totals["total_ws"]
+            })
 
         return jsonify(
             {
@@ -924,14 +930,18 @@ def ownerfnb_dashboard():
         # ==============================================================
         payment_sql = f"""
             SELECT t.metode_pembayaran AS method,
-                   SUM(t.total_harga_final) AS total
+                SUM(t.total_harga_final) AS total
             FROM transaksi t
-            JOIN detail_order_fnb dof ON dof.id_transaksi = t.id_transaksi
-            JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
-            JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
-            WHERE DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+            WHERE t.id_transaksi IN (
+                -- Subquery untuk mencari ID transaksi yang valid (milik tenant ini)
+                SELECT DISTINCT dof.id_transaksi
+                FROM detail_order_fnb dof
+                JOIN produk_fnb pf ON dof.id_produk = pf.id_produk
+                JOIN kategori_produk kp ON pf.id_kategori = kp.id_kategori
+                WHERE DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+                AND kp.id_tenant IN ({placeholders})
+            )
             AND t.status_pembayaran = 'Lunas'
-            AND kp.id_tenant IN ({placeholders})
             GROUP BY t.metode_pembayaran
             ORDER BY total DESC
         """
@@ -1036,6 +1046,7 @@ def ownerfnb_dashboard():
 # ============================================================
 # 3) WS DASHBOARD — FINAL FIXED VERSION
 # ============================================================
+
 @owner_endpoints.route('/ws-dashboard-data', methods=['GET', 'OPTIONS'])
 def ws_dashboard_data():
     """
@@ -1191,6 +1202,20 @@ def ws_dashboard_data():
         """, (start_date_str, end_date_str))
         eventRevenue = int((cur.fetchone() or {}).get("total") or 0)
 
+        daily_booking_revenue = int(s.get("totalRevenue") or 0)
+
+        # Total Global
+        grand_total_revenue = (
+            daily_booking_revenue + 
+            membershipRevenue + 
+            voRevenue + 
+            poRevenue + 
+            eventRevenue
+        )
+
+        # Update dictionary stats sebelum dikirim ke frontend
+        stats["totalRevenue"] = grand_total_revenue
+        
         productContribution = [
             {"name": "Membership", "value": membershipRevenue},
             {"name": "Virtual Office", "value": voRevenue},
@@ -1577,3 +1602,136 @@ def get_laporan_pajak_data():
         if cursor: cursor.close()
         if connection: connection.close()
       
+      
+      # ============================================================
+# 5) TRANSACTION LIST (Untuk Export Excel Sheet 1)
+# ============================================================
+@owner_endpoints.route("/transaction", methods=["GET"])
+@jwt_required()
+def transaction_sheet():
+    start_date, end_date = _req_range()
+    if not start_date or not end_date:
+        return _bad_request("start_date & end_date wajib")
+
+    conn = None
+    cur  = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
+        # Ambil data transaksi lunas dalam rentang tanggal
+        cur.execute("""
+            SELECT 
+                t.id_transaksi,
+                DATE(t.tanggal_transaksi) AS tanggal,
+                TIME(t.tanggal_transaksi) AS waktu,
+                t.metode_pembayaran,
+                t.total_harga_final,
+                t.subtotal,
+                t.pajak_nominal,
+                t.status_pembayaran,
+                COALESCE(t.nama_guest, u.nama, 'Guest') AS nama_guest,
+                t.fnb_type,
+                t.booking_source
+            FROM transaksi t
+            LEFT JOIN users u ON t.id_user = u.id_user
+            WHERE t.status_pembayaran = 'Lunas'
+              AND DATE(t.tanggal_transaksi) BETWEEN %s AND %s
+            ORDER BY t.tanggal_transaksi ASC
+        """, (start_date, end_date))
+
+        rows = cur.fetchall() or []
+
+        # Konversi objek Time/Date/Decimal ke String agar JSON valid
+        for r in rows:
+            for k, v in r.items():
+                if isinstance(v, (datetime, date, decimal.Decimal)):
+                    r[k] = str(v)
+                elif isinstance(v, timedelta): # Kadang waktu direturn sbg timedelta
+                    r[k] = str(v)
+
+        return jsonify({"message": "OK", "datas": rows}), 200
+
+    except Exception as e:
+        print("transaction_sheet error:", e)
+        return jsonify({"message": "Error", "error": str(e)}), 500
+    finally:
+        if cur: 
+            try: cur.close() 
+            except: pass
+        if conn: 
+            try: conn.close() 
+            except: pass
+
+
+# ============================================================
+# 6) TRANSACTION DETAIL (Untuk Export Excel Sheet 2)
+# ============================================================
+@owner_endpoints.route("/transaction/detail", methods=["GET"])
+@jwt_required()
+def transaction_detail_sheet():
+    id_transaksi = request.args.get("id_transaksi")
+    if not id_transaksi:
+        return _bad_request("id_transaksi wajib")
+
+    conn = None
+    cur  = None
+    try:
+        conn = get_connection()
+        cur  = conn.cursor(dictionary=True)
+
+        # --- A. Detail FNB ---
+        cur.execute("""
+            SELECT 
+                dof.id_detail_order,
+                pf.nama_produk,
+                dof.jumlah,
+                dof.harga_saat_order,
+                (dof.jumlah * dof.harga_saat_order) AS subtotal
+            FROM detail_order_fnb dof
+            JOIN produk_fnb pf ON pf.id_produk = dof.id_produk
+            WHERE dof.id_transaksi = %s
+        """, (id_transaksi,))
+        fnb_detail = cur.fetchall() or []
+
+        # --- B. Detail Working Space ---
+        cur.execute("""
+            SELECT 
+                br.id_booking,
+                r.nama_ruangan,
+                br.waktu_mulai,
+                br.waktu_selesai,
+                TIMESTAMPDIFF(HOUR, br.waktu_mulai, br.waktu_selesai) AS durasi_jam
+            FROM booking_ruangan br
+            JOIN ruangan r ON r.id_ruangan = br.id_ruangan
+            WHERE br.id_transaksi = %s
+        """, (id_transaksi,))
+        ws_detail = cur.fetchall() or []
+
+        # Sanitasi Data (Decimal/Date -> String)
+        for item in fnb_detail:
+            for k, v in item.items():
+                if isinstance(v, decimal.Decimal): item[k] = float(v) # atau str(v)
+        
+        for item in ws_detail:
+            for k, v in item.items():
+                if isinstance(v, (datetime, date)): item[k] = str(v)
+
+        return jsonify({
+            "message": "OK",
+            "datas": {
+                "fnb": fnb_detail,
+                "ws": ws_detail
+            }
+        }), 200
+
+    except Exception as e:
+        print("transaction_detail_sheet error:", e)
+        return jsonify({"message": "Error", "error": str(e)}), 500
+    finally:
+        if cur: 
+            try: cur.close() 
+            except: pass
+        if conn: 
+            try: conn.close() 
+            except: pass
