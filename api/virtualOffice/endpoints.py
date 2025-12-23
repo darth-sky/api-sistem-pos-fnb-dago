@@ -111,11 +111,24 @@ def register_virtual_office():
             return jsonify({"message": "Paket Virtual Office tidak ditemukan"}), 404
 
         # Buat transaksi dengan status 'Belum Lunas'
+# ... kode sebelumnya ...
+
+        # --- 3. Ambil Detail Paket & Buat Transaksi ---
+        cursor.execute("SELECT harga FROM paket_virtual_office WHERE id_paket_vo = %s", (id_paket_vo,))
+        paket = cursor.fetchone()
+        if not paket:
+            return jsonify({"message": "Paket Virtual Office tidak ditemukan"}), 404
+
+        # --- PERBAIKAN DISINI ---
+        # Ubah status_pembayaran dari 'Belum Lunas' menjadi 'Menunggu Konfirmasi'
+        # Ubah status_order dari 'Baru' menjadi 'Pending' (atau sesuaikan dengan enum order Anda)
         cursor.execute(
             "INSERT INTO transaksi (id_user, total_harga_final, metode_pembayaran, status_pembayaran, status_order) VALUES (%s, %s, %s, %s, %s)",
-            (id_user, paket["harga"], "Non-Tunai", "Belum Lunas", "Baru")
+            (id_user, paket["harga"], "Non-Tunai", "Menunggu Konfirmasi", "Pending")
         )
         id_transaksi = cursor.lastrowid
+
+        # ... kode setelahnya ...
 
         # --- 4. Simpan Data Klien VO dengan tanggal NULL dan status 'Baru' ---
         insert_vo_query = """

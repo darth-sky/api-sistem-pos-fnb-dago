@@ -1776,7 +1776,7 @@ def get_transaction_history():
         if connection and connection.is_connected():
             cursor.close()
             connection.close()
-    
+
 
 @admin_endpoints.route('/costBulananRead', methods=['GET'])
 @jwt_required()

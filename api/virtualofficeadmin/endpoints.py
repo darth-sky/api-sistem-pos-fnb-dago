@@ -205,27 +205,46 @@ def get_all_vo_requests():
 @virtualofficeadmin_endpoints.route('/approveRequests/<int:client_id>/approve', methods=['POST'])
 def approve_vo_request(client_id):
     """
-    PERUBAHAN LOGIKA:
-    Hanya menyetujui pendaftaran dan mengubah status ke 'Menunggu Pembayaran'.
-    TIDAK mengaktifkan layanan atau mengatur tanggal.
+    Menyetujui pendaftaran VO:
+    1. Ubah status VO jadi 'Menunggu Pembayaran'.
+    2. Ubah status Transaksi jadi 'Belum Lunas' (agar tombol bayar muncul di user).
     """
     connection = None
     cursor = None
     try:
         connection = get_connection()
-        cursor = connection.cursor() 
+        cursor = connection.cursor(dictionary=True) 
 
-        # --- PERBAIKAN: Hanya update status, JANGAN set tanggal ---
-        query_update = """
+        # 1. Ambil id_transaksi terkait
+        cursor.execute("SELECT id_transaksi FROM client_virtual_office WHERE id_client_vo = %s", (client_id,))
+        client_data = cursor.fetchone()
+
+        if not client_data:
+            return jsonify({"message": "ERROR", "error": "Data client VO tidak ditemukan"}), 404
+        
+        id_transaksi = client_data['id_transaksi']
+
+        # 2. Update status client_virtual_office
+        query_update_vo = """
             UPDATE client_virtual_office 
             SET status_client_vo = 'Menunggu Pembayaran'
             WHERE id_client_vo = %s AND status_client_vo = 'Menunggu Persetujuan'
         """
-        cursor.execute(query_update, (client_id,))
+        cursor.execute(query_update_vo, (client_id,))
         
         if cursor.rowcount == 0:
             connection.rollback()
-            return jsonify({"message": "ERROR", "error": "Permintaan tidak ditemukan atau statusnya salah"}), 404
+            return jsonify({"message": "ERROR", "error": "Gagal update status VO. Mungkin status bukan 'Menunggu Persetujuan'"}), 400
+
+        # 3. Update status TRANSAKSI menjadi 'Belum Lunas' (Pending)
+        # Ini PENTING agar tombol bayar muncul di frontend user
+        if id_transaksi:
+            query_update_trx = """
+                UPDATE transaksi 
+                SET status_pembayaran = 'Belum Lunas', status_order = 'Confirmed'
+                WHERE id_transaksi = %s
+            """
+            cursor.execute(query_update_trx, (id_transaksi,))
 
         connection.commit()
         return jsonify({"message": "Request approved, waiting for payment"}), 200
@@ -233,14 +252,12 @@ def approve_vo_request(client_id):
     except Exception as e:
         if connection: connection.rollback()
         print(f"Error in /approveRequests: {e}")
-        traceback.print_exc()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if 'cursor' in locals(): cursor.close()
-        if 'connection' in locals(): connection.close()
-        
-                
-# Ganti endpoint /rejectRequests Anda dengan ini
+        if 'cursor' in locals() and cursor: cursor.close()
+        if 'connection' in locals() and connection: connection.close()
+
+
 @virtualofficeadmin_endpoints.route('/rejectRequests/<int:client_id>/reject', methods=['POST'])
 def reject_vo_request(client_id):
     """
@@ -250,9 +267,9 @@ def reject_vo_request(client_id):
     cursor = None
     try:
         connection = get_connection()
-        cursor = connection.cursor(dictionary=True) # Butuh dictionary untuk baca id_transaksi
+        cursor = connection.cursor(dictionary=True)
 
-        # 1. Ambil id_transaksi sebelum me-reject
+        # 1. Ambil id_transaksi
         cursor.execute("SELECT id_transaksi FROM client_virtual_office WHERE id_client_vo = %s", (client_id,))
         client_data = cursor.fetchone()
 
@@ -264,9 +281,9 @@ def reject_vo_request(client_id):
         # 2. Update status client_virtual_office
         cursor.execute("UPDATE client_virtual_office SET status_client_vo = 'Ditolak' WHERE id_client_vo = %s", (client_id,))
         
-        # --- PERBAIKAN: Batalkan juga transaksinya ---
+        # 3. Update status TRANSAKSI menjadi 'Dibatalkan'
         if id_transaksi:
-            cursor.execute("UPDATE transaksi SET status_pembayaran = 'Dibatalkan' WHERE id_transaksi = %s", (id_transaksi,))
+            cursor.execute("UPDATE transaksi SET status_pembayaran = 'Dibatalkan', status_order = 'Batal' WHERE id_transaksi = %s", (id_transaksi,))
 
         connection.commit()
         
@@ -274,10 +291,8 @@ def reject_vo_request(client_id):
     except Exception as e:
         if connection: connection.rollback()
         print(f"Error in /rejectRequests: {e}")
-        traceback.print_exc()
         return jsonify({"message": "ERROR", "error": str(e)}), 500
     finally:
-        if 'cursor' in locals(): cursor.close()
-        if 'connection' in locals(): connection.close()
-        
+        if 'cursor' in locals() and cursor: cursor.close()
+        if 'connection' in locals() and connection: connection.close()        
         

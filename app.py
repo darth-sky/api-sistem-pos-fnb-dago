@@ -4,6 +4,14 @@ from flask import Flask
 from flask_cors import CORS
 from dotenv import load_dotenv
 from extensions import jwt
+
+# --- Import Library Scheduler (BARU) ---
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
+# Import fungsi task yang baru dibuat
+from api.utils.scheduler_task import cancel_expired_transactions
+
+# Import existing blueprints
 from api.books.endpoints import books_endpoints
 from api.menu.endpoints import menu_endpoints
 from api.authors.endpoints import authors_endpoints
@@ -45,13 +53,12 @@ app = Flask(__name__)
 app.config.from_object(Config)
 CORS(app)
 
-
 jwt.init_app(app)
 
 # register the blueprint
 app.register_blueprint(auth_endpoints, url_prefix='/api/v1/auth')
 app.register_blueprint(protected_endpoints,
-                       url_prefix='/api/v1/protected')
+                        url_prefix='/api/v1/protected')
 app.register_blueprint(books_endpoints, url_prefix='/api/v1/books')
 app.register_blueprint(authors_endpoints, url_prefix='/api/v1/authors')
 app.register_blueprint(static_file_server, url_prefix='/static/')
@@ -81,6 +88,28 @@ app.register_blueprint(coaadmin_endpoints, url_prefix='/api/v1/coaadmin')
 app.register_blueprint(faq_endpoints, url_prefix='/api/v1/faq')
 app.register_blueprint(callback_endpoints, url_prefix='/api/callback')
 app.register_blueprint(settings_endpoints, url_prefix='/api/v1/settings')
+
+# --- SETUP SCHEDULER (BARU) ---
+def start_scheduler():
+    # Inisialisasi scheduler
+    scheduler = BackgroundScheduler()
+    
+    # Tambahkan Job:
+    # func: fungsi yang akan dijalankan (dari scheduler_task.py)
+    # trigger: interval (berulang)
+    # minutes: setiap berapa menit dijalankan (contoh: 10 menit)
+    scheduler.add_job(func=cancel_expired_transactions, trigger="interval", minutes=10)
+    
+    # Mulai scheduler
+    scheduler.start()
+    print(">>> [SYSTEM] Scheduler Aktif: Pengecekan transaksi expired berjalan setiap 10 menit.")
+    
+    # Pastikan scheduler mati saat aplikasi berhenti (mencegah memory leak)
+    atexit.register(lambda: scheduler.shutdown())
+
+# Jalankan scheduler sebelum app.run()
+start_scheduler()
+# ------------------------------
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', debug=True, port=5000)
